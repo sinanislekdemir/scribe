@@ -1,6 +1,6 @@
 [package]
 name = "scribe"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Sinan Islekdemir <sinan@islekdemir.com>"]
 description = "A focused terminal editor for long-form prose stored as ODT in Nextcloud"
