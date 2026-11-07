@@ -17,29 +17,16 @@ use unicode_width::UnicodeWidthChar;
 use crate::ai;
 use crate::backups;
 use crate::config::{self, Config};
-use crate::editor::{Editor, LineKind, MarkResult, smart_quote_for, smart_single_quote_for};
+use crate::editor::{
+    Cursor, Editor, LineKind, MarkResult, smart_quote_for, smart_single_quote_for,
+};
 use crate::lock::{self, HeldLock, Identity, Kicker, LockEvent, LockHandle, LockInfo};
-use crate::model::Book;
+use crate::model::{Align, Book, Chapter, ParaKind};
 use crate::nextcloud::{Client, RemoteEntry};
 use crate::odt::OdtDocument;
-
-const PLAIN: Color = Color::Rgb(216, 222, 233);
-const BOLD_C: Color = Color::Rgb(255, 184, 108);
-const ITALIC_C: Color = Color::Rgb(199, 146, 234);
-const BOTH_C: Color = Color::Rgb(255, 121, 198);
-const HEADING: Color = Color::Rgb(139, 233, 253);
-const ACCENT: Color = Color::Rgb(255, 209, 102);
-const DIM: Color = Color::Rgb(120, 130, 145);
-const GOOD: Color = Color::Rgb(163, 190, 140);
-const ERR: Color = Color::Rgb(255, 107, 107);
-const PANEL_BG: Color = Color::Rgb(30, 34, 42);
-const EDITOR_BG: Color = Color::Rgb(20, 24, 31);
-const PAGE_BG: Color = Color::Rgb(27, 32, 41);
-const PAGE_BORDER: Color = Color::Rgb(70, 80, 100);
-const SELECT_BG: Color = Color::Rgb(59, 66, 82);
-const SELECTION_BG: Color = Color::Rgb(53, 68, 92);
-const AI_ISSUE_BG: Color = Color::Rgb(58, 48, 36);
-const AI_FOCUS_BG: Color = Color::Rgb(96, 72, 38);
+use crate::search::{self, SearchMatch};
+use crate::settings::{self, Settings};
+use crate::theme::{Palette, ThemeName};
 
 const APP_AUTHOR: &str = env!("CARGO_PKG_AUTHORS");
 const APP_REPO: &str = env!("CARGO_PKG_REPOSITORY");
@@ -69,16 +56,18 @@ impl SaveState {
         }
     }
 
-    fn color(&self) -> Color {
+    fn color(&self, palette: Palette) -> Color {
         match self {
-            SaveState::Idle => ACCENT,
-            SaveState::Saving => HEADING,
-            SaveState::Saved => GOOD,
-            SaveState::Offline => ERR,
-            SaveState::Conflict => ERR,
+            SaveState::Idle => palette.accent,
+            SaveState::Saving => palette.heading,
+            SaveState::Saved => palette.good,
+            SaveState::Offline => palette.error,
+            SaveState::Conflict => palette.error,
         }
     }
 }
+
+type NotesFetchResult = std::result::Result<Option<(Vec<u8>, Option<String>)>, String>;
 
 enum NetEvent {
     Listed {
@@ -88,6 +77,10 @@ enum NetEvent {
     Fetched {
         path: String,
         result: std::result::Result<(Vec<u8>, Option<String>), String>,
+    },
+    NotesFetched {
+        path: String,
+        result: NotesFetchResult,
     },
     Saved {
         path: String,
@@ -112,6 +105,7 @@ enum InputKind {
     BookTitle,
     NewFileName,
     SaveCopy,
+    ConfigField,
 }
 
 impl Input {
@@ -275,6 +269,8 @@ enum Overlay {
     LockWaiting,
     LockForce,
     AiPanel,
+    Config,
+    Selection,
     About,
 }
 
@@ -286,9 +282,19 @@ enum MenuAction {
     Quit,
     Undo,
     Redo,
+    Find,
     MarkSelection,
+    SelectionActions,
     Bold,
     Italic,
+    Underline,
+    Strike,
+    Subheading,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    AlignJustify,
+    LineBreak,
     NewChapter,
     ChapterTitle,
     BookTitle,
@@ -298,6 +304,8 @@ enum MenuAction {
     Redraw,
     Help,
     AiCheck,
+    Config,
+    Notes,
     About,
 }
 
@@ -357,9 +365,19 @@ const MENUS: &[MenuDef] = &[
                 action: MenuAction::Redo,
             },
             MenuEntry::Item {
+                label: "Find…",
+                shortcut: "F3",
+                action: MenuAction::Find,
+            },
+            MenuEntry::Item {
                 label: "Mark selection",
                 shortcut: "Ctrl+Space",
                 action: MenuAction::MarkSelection,
+            },
+            MenuEntry::Item {
+                label: "Selection actions…",
+                shortcut: "",
+                action: MenuAction::SelectionActions,
             },
             MenuEntry::Separator,
             MenuEntry::Item {
@@ -371,6 +389,48 @@ const MENUS: &[MenuDef] = &[
                 label: "Italic",
                 shortcut: "Alt+I",
                 action: MenuAction::Italic,
+            },
+            MenuEntry::Item {
+                label: "Underline",
+                shortcut: "Alt+U",
+                action: MenuAction::Underline,
+            },
+            MenuEntry::Item {
+                label: "Strikethrough",
+                shortcut: "Alt+S",
+                action: MenuAction::Strike,
+            },
+            MenuEntry::Separator,
+            MenuEntry::Item {
+                label: "Subheading (H3)",
+                shortcut: "",
+                action: MenuAction::Subheading,
+            },
+            MenuEntry::Item {
+                label: "Align left",
+                shortcut: "",
+                action: MenuAction::AlignLeft,
+            },
+            MenuEntry::Item {
+                label: "Align center",
+                shortcut: "",
+                action: MenuAction::AlignCenter,
+            },
+            MenuEntry::Item {
+                label: "Align right",
+                shortcut: "",
+                action: MenuAction::AlignRight,
+            },
+            MenuEntry::Item {
+                label: "Justify",
+                shortcut: "",
+                action: MenuAction::AlignJustify,
+            },
+            MenuEntry::Separator,
+            MenuEntry::Item {
+                label: "Line break",
+                shortcut: "Shift+Enter",
+                action: MenuAction::LineBreak,
             },
         ],
     },
@@ -412,11 +472,24 @@ const MENUS: &[MenuDef] = &[
     },
     MenuDef {
         label: "Tools",
-        entries: &[MenuEntry::Item {
-            label: "Check writing (AI)…",
-            shortcut: "F8",
-            action: MenuAction::AiCheck,
-        }],
+        entries: &[
+            MenuEntry::Item {
+                label: "Configuration…",
+                shortcut: "Ctrl+,",
+                action: MenuAction::Config,
+            },
+            MenuEntry::Item {
+                label: "Notes",
+                shortcut: "F7",
+                action: MenuAction::Notes,
+            },
+            MenuEntry::Separator,
+            MenuEntry::Item {
+                label: "Check writing (AI)…",
+                shortcut: "F8",
+                action: MenuAction::AiCheck,
+            },
+        ],
     },
     MenuDef {
         label: "View",
@@ -448,6 +521,43 @@ const MENUS: &[MenuDef] = &[
 struct MenuState {
     active: usize,
     selected: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectionAction {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Delete,
+    None,
+}
+
+const SELECTION_ACTIONS: [(&str, SelectionAction); 6] = [
+    ("Bold", SelectionAction::Bold),
+    ("Italic", SelectionAction::Italic),
+    ("Underline", SelectionAction::Underline),
+    ("Strikethrough", SelectionAction::Strike),
+    ("Delete", SelectionAction::Delete),
+    ("None (keep selection)", SelectionAction::None),
+];
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SelectionMenu {
+    selected: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SearchState {
+    active: bool,
+    query: String,
+    cursor: usize,
+    matches: Vec<SearchMatch>,
+    current: Option<usize>,
+    origin: Cursor,
+    dirty: bool,
+    no_match: bool,
+    revision: u64,
 }
 
 struct CacheMeta {
@@ -496,6 +606,9 @@ enum AiEvent {
         chapter: usize,
         text_hash: u64,
         result: std::result::Result<Vec<ai::Issue>, String>,
+    },
+    TestDone {
+        result: std::result::Result<String, String>,
     },
 }
 
@@ -554,6 +667,170 @@ impl AiPanel {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigField {
+    BaseUrl,
+    Model,
+    ApiKey,
+    Language,
+    JsonMode,
+    Timeout,
+    Theme,
+}
+
+const CONFIG_FIELDS: [ConfigField; 7] = [
+    ConfigField::BaseUrl,
+    ConfigField::Model,
+    ConfigField::ApiKey,
+    ConfigField::Language,
+    ConfigField::JsonMode,
+    ConfigField::Timeout,
+    ConfigField::Theme,
+];
+
+impl ConfigField {
+    fn label(self) -> &'static str {
+        match self {
+            ConfigField::BaseUrl => "Base URL",
+            ConfigField::Model => "Model",
+            ConfigField::ApiKey => "API key",
+            ConfigField::Language => "Language",
+            ConfigField::JsonMode => "JSON mode",
+            ConfigField::Timeout => "Timeout",
+            ConfigField::Theme => "Theme",
+        }
+    }
+
+    fn is_text(self) -> bool {
+        matches!(
+            self,
+            ConfigField::BaseUrl
+                | ConfigField::Model
+                | ConfigField::ApiKey
+                | ConfigField::Language
+                | ConfigField::Timeout
+        )
+    }
+}
+
+struct ConfigPanel {
+    ai: ai::AiConfig,
+    original_theme: ThemeName,
+    selected: usize,
+    editing: Option<Input>,
+    status: Option<(String, bool)>,
+    testing: bool,
+}
+
+impl ConfigPanel {
+    fn new(ai: ai::AiConfig, theme: ThemeName) -> Self {
+        Self {
+            ai,
+            original_theme: theme,
+            selected: 0,
+            editing: None,
+            status: None,
+            testing: false,
+        }
+    }
+
+    fn field(&self) -> ConfigField {
+        CONFIG_FIELDS[self.selected.min(CONFIG_FIELDS.len() - 1)]
+    }
+
+    /// The key is only ever shown masked, including while it is being replaced.
+    fn display_key(&self) -> String {
+        if self.field() == ConfigField::ApiKey
+            && let Some(input) = &self.editing
+        {
+            let count = input.value.chars().count().min(40);
+            if count == 0 {
+                "(type a new key; blank keeps current)".to_string()
+            } else {
+                "•".repeat(count)
+            }
+        } else {
+            ai::mask_key(&self.ai.api_key)
+        }
+    }
+
+    fn display_value(&self, field: ConfigField) -> String {
+        match field {
+            ConfigField::BaseUrl => self.ai.base_url.clone(),
+            ConfigField::Model => self.ai.model.clone(),
+            ConfigField::ApiKey => self.display_key(),
+            ConfigField::Language => self.ai.language.clone(),
+            ConfigField::JsonMode => {
+                if self.ai.json_mode {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
+            }
+            ConfigField::Timeout => format!("{} s", self.ai.timeout_seconds),
+            ConfigField::Theme => String::new(),
+        }
+    }
+
+    fn start_edit(&mut self) {
+        let field = self.field();
+        if !field.is_text() {
+            return;
+        }
+        let current = match field {
+            ConfigField::ApiKey => String::new(),
+            ConfigField::Timeout => self.ai.timeout_seconds.to_string(),
+            _ => self.display_value(field),
+        };
+        self.editing = Some(Input::new(InputKind::ConfigField, field.label(), current));
+        self.status = None;
+    }
+
+    fn commit_edit(&mut self) {
+        let Some(input) = self.editing.take() else {
+            return;
+        };
+        let value = input.value.trim().to_string();
+        match self.field() {
+            ConfigField::BaseUrl => self.ai.base_url = value,
+            ConfigField::Model => self.ai.model = value,
+            ConfigField::ApiKey => {
+                if !value.is_empty() {
+                    self.ai.api_key = value;
+                }
+            }
+            ConfigField::Language => self.ai.language = value,
+            ConfigField::Timeout => match value.parse::<u64>() {
+                Ok(seconds) => self.ai.timeout_seconds = seconds.max(5),
+                Err(_) => self.status = Some(("Timeout must be a number".to_string(), true)),
+            },
+            ConfigField::JsonMode | ConfigField::Theme => {}
+        }
+    }
+
+    fn set_status(&mut self, message: impl Into<String>, error: bool) {
+        self.status = Some((message.into(), error));
+    }
+}
+
+/// The per-document state that is parked while the notes sidecar is open.
+struct DocMemory {
+    editor: Editor,
+    local_path: Option<PathBuf>,
+    remote_path: Option<String>,
+    etag: Option<String>,
+    create_new: bool,
+    save_state: SaveState,
+    conflict: bool,
+}
+
+/// Remote notes are fetched in the background. The generated document is kept
+/// here in case the sidecar does not exist yet.
+struct PendingNotes {
+    path: String,
+    created: OdtDocument,
+}
+
 pub struct App {
     cfg: Option<Config>,
     client: Option<Client>,
@@ -597,11 +874,23 @@ pub struct App {
     ai_seq: u64,
     ai_job: Option<AiJob>,
     ai_panel: Option<AiPanel>,
+    settings: Settings,
+    palette: Palette,
+    config_panel: Option<ConfigPanel>,
+    selection_menu: Option<SelectionMenu>,
+    notes_active: bool,
+    notes_loading: bool,
+    notes_main: Option<DocMemory>,
+    notes_doc: Option<DocMemory>,
+    pending_notes: Option<PendingNotes>,
+    search: SearchState,
 }
 
 impl App {
     pub fn new_remote(cfg: Config) -> Result<Self> {
         config::ensure_dirs()?;
+        let ui_settings = settings::load().unwrap_or_default();
+        let palette = ui_settings.theme.palette();
         let client = Client::new(&cfg);
         let lock_client = Some(Client::with_timeout(&cfg, Duration::from_secs(5)));
         let lock_identity = Identity::new(&cfg.login_name);
@@ -656,6 +945,16 @@ impl App {
             ai_seq: 0,
             ai_job: None,
             ai_panel: None,
+            settings: ui_settings,
+            palette,
+            config_panel: None,
+            selection_menu: None,
+            notes_active: false,
+            notes_loading: false,
+            notes_main: None,
+            notes_doc: None,
+            pending_notes: None,
+            search: SearchState::default(),
         };
         app.refresh_file_picker();
         Ok(app)
@@ -663,6 +962,8 @@ impl App {
 
     pub fn new_local(path: PathBuf) -> Result<Self> {
         config::ensure_dirs()?;
+        let ui_settings = settings::load().unwrap_or_default();
+        let palette = ui_settings.theme.palette();
         let (net_tx, net_rx) = mpsc::channel();
         let (lock_tx, lock_rx) = mpsc::channel();
         let (ai_tx, ai_rx) = mpsc::channel();
@@ -709,6 +1010,16 @@ impl App {
             ai_seq: 0,
             ai_job: None,
             ai_panel: None,
+            settings: ui_settings,
+            palette,
+            config_panel: None,
+            selection_menu: None,
+            notes_active: false,
+            notes_loading: false,
+            notes_main: None,
+            notes_doc: None,
+            pending_notes: None,
+            search: SearchState::default(),
         };
         if path.exists() {
             let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
@@ -792,6 +1103,7 @@ impl App {
         self.etag = etag;
         self.create_new = create_new;
         self.editor = Some(ed);
+        self.search = SearchState::default();
         self.overlay = Overlay::None;
         self.file_picker = None;
         self.chapter_picker = None;
@@ -809,6 +1121,13 @@ impl App {
     }
 
     fn update_config_last_file(&mut self) {
+        if self
+            .remote_path
+            .as_deref()
+            .is_some_and(|path| path.ends_with(".notes.odt"))
+        {
+            return;
+        }
         if let (Some(cfg), Some(path)) = (&mut self.cfg, &self.remote_path) {
             cfg.last_file = Some(path.clone());
             if let Some((folder, _)) = path.rsplit_once('/') {
@@ -1005,6 +1324,20 @@ impl App {
                         }
                     }
                 }
+                NetEvent::NotesFetched { path, result } => {
+                    if self
+                        .pending_notes
+                        .as_ref()
+                        .map(|pending| pending.path.as_str())
+                        != Some(path.as_str())
+                    {
+                        continue;
+                    }
+                    let Some(pending) = self.pending_notes.take() else {
+                        continue;
+                    };
+                    self.finish_notes_fetch(pending, result);
+                }
                 NetEvent::Saved {
                     path,
                     rev,
@@ -1015,6 +1348,26 @@ impl App {
                     self.net_busy = false;
                     if let Some(e) = backup_error {
                         self.toast(format!("Backup failed: {e}"));
+                    }
+                    let parked = if conflict {
+                        self.update_parked_save(&path, None, rev, true, false)
+                    } else {
+                        match &result {
+                            Ok(etag) => {
+                                self.update_parked_save(&path, etag.clone(), rev, false, false)
+                            }
+                            Err(_) => self.update_parked_save(&path, None, rev, false, true),
+                        }
+                    };
+                    if let Some(label) = parked {
+                        if conflict {
+                            self.toast(format!(
+                                "{label} changed remotely; resolve it when you switch back."
+                            ));
+                        } else if result.is_err() {
+                            self.toast(format!("{label} save failed."));
+                        }
+                        continue;
                     }
                     if conflict {
                         self.conflict = true;
@@ -1661,6 +2014,8 @@ impl App {
         if self.remote_path.as_deref() == Some(path.as_str()) && self.editor.is_some() {
             return;
         }
+        self.clear_notes_session();
+        self.search = SearchState::default();
         let Some(client) = self.lock_client.clone() else {
             self.open_remote(path);
             return;
@@ -1760,6 +2115,20 @@ impl App {
             self.try_quit();
             return;
         }
+        if key.code == KeyCode::F(3) {
+            if self.overlay == Overlay::None {
+                if self.search.active {
+                    self.search_next();
+                } else {
+                    self.start_search();
+                }
+            }
+            return;
+        }
+        if self.search.active {
+            self.handle_search_key(key);
+            return;
+        }
         if key.code == KeyCode::F(9) {
             match self.overlay {
                 Overlay::None => self.open_menu(),
@@ -1780,7 +2149,16 @@ impl App {
             }
             return;
         }
+        if key.code == KeyCode::F(7) {
+            if self.overlay == Overlay::None {
+                self.action_notes();
+            }
+            return;
+        }
         if key.code == KeyCode::F(1) || (key.code == KeyCode::Char('h') && alt_only(&key)) {
+            if self.overlay == Overlay::Config {
+                return;
+            }
             self.overlay = if self.overlay == Overlay::Help {
                 Overlay::None
             } else {
@@ -1789,6 +2167,9 @@ impl App {
             return;
         }
         if key.code == KeyCode::Char('a') && alt_only(&key) {
+            if self.overlay == Overlay::Config {
+                return;
+            }
             self.overlay = if self.overlay == Overlay::About {
                 Overlay::None
             } else {
@@ -1799,6 +2180,14 @@ impl App {
         if key.code == KeyCode::Char('l') && ctrl(&key) {
             self.redraw_requested = true;
             self.toast("Screen redrawn.");
+            return;
+        }
+        if key.code == KeyCode::Char(',') && (ctrl(&key) || alt_only(&key)) {
+            match self.overlay {
+                Overlay::Config => self.cancel_config(),
+                Overlay::None | Overlay::Menu => self.action_config(),
+                _ => {}
+            }
             return;
         }
         match self.overlay {
@@ -1820,6 +2209,14 @@ impl App {
             }
             Overlay::AiPanel => {
                 self.handle_ai_panel_key(key);
+                return;
+            }
+            Overlay::Config => {
+                self.handle_config_key(key);
+                return;
+            }
+            Overlay::Selection => {
+                self.handle_selection_key(key);
                 return;
             }
             Overlay::Menu => {
@@ -1893,6 +2290,14 @@ impl App {
             self.action_italic();
             return;
         }
+        if key.code == KeyCode::Char('u') && alt_only(&key) {
+            self.action_underline();
+            return;
+        }
+        if key.code == KeyCode::Char('s') && alt_only(&key) {
+            self.action_strike();
+            return;
+        }
         let Some(ed) = &mut self.editor else {
             return;
         };
@@ -1900,6 +2305,9 @@ impl App {
         match key.code {
             KeyCode::Char(c) if is_text_key(&key) => {
                 ed.insert_typed_char(c);
+            }
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) || alt_only(&key) => {
+                ed.insert_line_break()
             }
             KeyCode::Enter => ed.newline(),
             KeyCode::Char('w') if ctrl(&key) => ed.delete_word_back(),
@@ -1955,10 +2363,29 @@ impl App {
 
     fn menu_item_enabled(&self, action: MenuAction) -> bool {
         match action {
-            MenuAction::Quit | MenuAction::Redraw | MenuAction::Help | MenuAction::About => true,
+            MenuAction::Quit
+            | MenuAction::Redraw
+            | MenuAction::Help
+            | MenuAction::Config
+            | MenuAction::About => true,
             MenuAction::Open => self.client.is_some(),
             MenuAction::AiCheck => self.editor.is_some(),
+            MenuAction::Notes => self.editor.is_some() && !self.notes_loading,
             MenuAction::DownloadCopy => self.remote_path.is_some() && self.editor.is_some(),
+            MenuAction::SelectionActions
+            | MenuAction::Bold
+            | MenuAction::Italic
+            | MenuAction::Underline
+            | MenuAction::Strike => self
+                .editor
+                .as_ref()
+                .is_some_and(|editor| editor.has_selection()),
+            MenuAction::Subheading
+            | MenuAction::AlignLeft
+            | MenuAction::AlignCenter
+            | MenuAction::AlignRight
+            | MenuAction::AlignJustify
+            | MenuAction::LineBreak => self.editor.is_some(),
             _ => self.editor.is_some(),
         }
     }
@@ -2034,9 +2461,19 @@ impl App {
             MenuAction::Quit => self.try_quit(),
             MenuAction::Undo => self.action_undo(),
             MenuAction::Redo => self.action_redo(),
+            MenuAction::Find => self.start_search(),
             MenuAction::MarkSelection => self.action_mark(),
+            MenuAction::SelectionActions => self.action_selection_actions(),
             MenuAction::Bold => self.action_bold(),
             MenuAction::Italic => self.action_italic(),
+            MenuAction::Underline => self.action_underline(),
+            MenuAction::Strike => self.action_strike(),
+            MenuAction::Subheading => self.action_subheading(),
+            MenuAction::AlignLeft => self.action_align(Align::Left),
+            MenuAction::AlignCenter => self.action_align(Align::Center),
+            MenuAction::AlignRight => self.action_align(Align::Right),
+            MenuAction::AlignJustify => self.action_align(Align::Justify),
+            MenuAction::LineBreak => self.action_line_break(),
             MenuAction::NewChapter => self.action_new_chapter(),
             MenuAction::ChapterTitle => self.action_chapter_title(),
             MenuAction::BookTitle => self.action_book_title(),
@@ -2046,6 +2483,8 @@ impl App {
             MenuAction::Redraw => self.action_redraw(),
             MenuAction::Help => self.action_help(),
             MenuAction::AiCheck => self.action_ai_check(),
+            MenuAction::Config => self.action_config(),
+            MenuAction::Notes => self.action_notes(),
             MenuAction::About => self.action_about(),
         }
     }
@@ -2160,6 +2599,204 @@ impl App {
         }
     }
 
+    fn start_search(&mut self) {
+        let Some(editor) = &mut self.editor else {
+            return;
+        };
+        editor.clear_selection();
+        if editor.revision != self.search.revision {
+            self.search.matches.clear();
+            self.search.current = None;
+            self.search.dirty = true;
+            self.search.no_match = false;
+        }
+        self.search.origin = editor.cursor;
+        self.search.active = true;
+        self.search.cursor = self.search.query.chars().count();
+        self.search.no_match = false;
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.search.active = false;
+                if self.search.current.is_none()
+                    && let Some(editor) = &mut self.editor
+                {
+                    let origin = self.search.origin;
+                    if editor.current_chapter() != origin.chapter {
+                        editor.goto_chapter(origin.chapter);
+                    }
+                    editor.reveal(origin.para, origin.offset);
+                }
+            }
+            KeyCode::Enter => self.run_search_from_cursor(),
+            KeyCode::Backspace => self.search_backspace(),
+            KeyCode::Delete => self.search_delete(),
+            KeyCode::Left => self.search_move_cursor(-1),
+            KeyCode::Right => self.search_move_cursor(1),
+            KeyCode::Home => self.search.cursor = 0,
+            KeyCode::End => self.search.cursor = self.search.query.chars().count(),
+            KeyCode::Char('w') if ctrl(&key) => self.search_delete_word_back(),
+            KeyCode::Char('u') if ctrl(&key) => self.search_clear_query(),
+            KeyCode::Char(ch)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.search_insert(ch)
+            }
+            _ => {}
+        }
+    }
+
+    fn search_next(&mut self) {
+        if self.search.query.is_empty() {
+            return;
+        }
+        if self.search.dirty || self.search.matches.is_empty() {
+            self.run_search_from_cursor();
+            return;
+        }
+        let Some(current) = self.search.current else {
+            self.run_search_from_cursor();
+            return;
+        };
+        let Some(item) = self.search.matches.get(current).copied() else {
+            self.run_search_from_cursor();
+            return;
+        };
+        let Some((index, wrapped)) =
+            search::next_match(&self.search.matches, item.position(), false)
+        else {
+            return;
+        };
+        self.apply_search_match(index, wrapped);
+    }
+
+    fn run_search_from_cursor(&mut self) {
+        if self.search.query.is_empty() {
+            self.search.matches.clear();
+            self.search.current = None;
+            self.search.no_match = false;
+            self.search.dirty = false;
+            return;
+        }
+        let Some(editor) = &self.editor else {
+            return;
+        };
+        let matches = search::find_matches(&editor.doc.book, &self.search.query);
+        let position = (
+            editor.cursor.chapter,
+            editor.cursor.para,
+            editor.cursor.offset,
+        );
+        self.search.matches = matches;
+        self.search.dirty = false;
+        self.search.current = None;
+        self.search.revision = editor.revision;
+        let Some((index, wrapped)) = search::next_match(&self.search.matches, position, true)
+        else {
+            self.search.no_match = true;
+            return;
+        };
+        self.search.no_match = false;
+        self.apply_search_match(index, wrapped);
+    }
+
+    fn apply_search_match(&mut self, index: usize, wrapped: bool) {
+        let Some(item) = self.search.matches.get(index).copied() else {
+            return;
+        };
+        self.search.current = Some(index);
+        self.search.no_match = false;
+        if let Some(editor) = &mut self.editor {
+            if editor.current_chapter() != item.chapter {
+                editor.goto_chapter(item.chapter);
+            }
+            editor.reveal(item.para, item.start);
+        }
+        if wrapped {
+            self.toast("Search wrapped.");
+        }
+    }
+
+    fn search_insert(&mut self, ch: char) {
+        let width = crossterm::terminal::size().unwrap_or((100, 40)).0;
+        let max = search_query_capacity(width);
+        let current_width: usize = self
+            .search
+            .query
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width + char_width > max {
+            return;
+        }
+        let at = search_byte_at(&self.search.query, self.search.cursor);
+        self.search.query.insert(at, ch);
+        self.search.cursor += 1;
+        self.search_edited();
+    }
+
+    fn search_backspace(&mut self) {
+        if self.search.cursor == 0 {
+            return;
+        }
+        let start = search_byte_at(&self.search.query, self.search.cursor - 1);
+        let end = search_byte_at(&self.search.query, self.search.cursor);
+        self.search.query.replace_range(start..end, "");
+        self.search.cursor -= 1;
+        self.search_edited();
+    }
+
+    fn search_delete(&mut self) {
+        if self.search.cursor >= self.search.query.chars().count() {
+            return;
+        }
+        let start = search_byte_at(&self.search.query, self.search.cursor);
+        let end = search_byte_at(&self.search.query, self.search.cursor + 1);
+        self.search.query.replace_range(start..end, "");
+        self.search_edited();
+    }
+
+    fn search_move_cursor(&mut self, delta: isize) {
+        let len = self.search.query.chars().count() as isize;
+        self.search.cursor = (self.search.cursor as isize + delta).clamp(0, len) as usize;
+    }
+
+    fn search_delete_word_back(&mut self) {
+        if self.search.cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.search.query.chars().collect();
+        let mut index = self.search.cursor;
+        while index > 0 && chars[index - 1].is_whitespace() {
+            index -= 1;
+        }
+        while index > 0 && !chars[index - 1].is_whitespace() {
+            index -= 1;
+        }
+        let start = search_byte_at(&self.search.query, index);
+        let end = search_byte_at(&self.search.query, self.search.cursor);
+        self.search.query.replace_range(start..end, "");
+        self.search.cursor = index;
+        self.search_edited();
+    }
+
+    fn search_clear_query(&mut self) {
+        self.search.query.clear();
+        self.search.cursor = 0;
+        self.search_edited();
+    }
+
+    fn search_edited(&mut self) {
+        self.search.dirty = true;
+        self.search.matches.clear();
+        self.search.current = None;
+        self.search.no_match = false;
+    }
+
     fn action_mark(&mut self) {
         let Some(result) = self.editor.as_mut().map(Editor::toggle_mark) else {
             return;
@@ -2167,10 +2804,23 @@ impl App {
         match result {
             MarkResult::Started => self.toast("Mark set. Move, then Ctrl+Space again."),
             MarkResult::Finished(count) => {
-                self.toast(format!("{count} chars selected. Delete to remove."));
+                self.selection_menu = Some(SelectionMenu::default());
+                self.overlay = Overlay::Selection;
+                self.toast(format!("{count} chars selected."));
             }
             MarkResult::Restarted => self.toast("New mark set at cursor."),
             MarkResult::Cancelled => self.toast("Empty mark cleared."),
+        }
+    }
+
+    fn action_selection_actions(&mut self) {
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| editor.has_selection())
+        {
+            self.selection_menu = Some(SelectionMenu::default());
+            self.overlay = Overlay::Selection;
         }
     }
 
@@ -2198,6 +2848,90 @@ impl App {
         }
     }
 
+    fn action_underline(&mut self) {
+        let Some(ed) = &mut self.editor else {
+            return;
+        };
+        let rev = ed.revision;
+        ed.toggle_underline();
+        if ed.revision != rev {
+            self.last_edit = Instant::now();
+            self.save_state = SaveState::Idle;
+        }
+    }
+
+    fn action_strike(&mut self) {
+        let Some(ed) = &mut self.editor else {
+            return;
+        };
+        let rev = ed.revision;
+        ed.toggle_strike();
+        if ed.revision != rev {
+            self.last_edit = Instant::now();
+            self.save_state = SaveState::Idle;
+        }
+    }
+
+    fn action_subheading(&mut self) {
+        let Some(ed) = &mut self.editor else {
+            return;
+        };
+        let rev = ed.revision;
+        let subheading = ed.toggle_subheading();
+        if ed.revision != rev {
+            self.last_edit = Instant::now();
+            self.save_state = SaveState::Idle;
+        }
+        self.toast(if subheading {
+            "Paragraph is now a subheading."
+        } else {
+            "Subheading changed to body text."
+        });
+    }
+
+    fn action_align(&mut self, align: Align) {
+        let Some(ed) = &mut self.editor else {
+            return;
+        };
+        let rev = ed.revision;
+        ed.set_alignment(align);
+        if ed.revision != rev {
+            self.last_edit = Instant::now();
+            self.save_state = SaveState::Idle;
+        }
+        let label = match align {
+            Align::Left => "left",
+            Align::Center => "center",
+            Align::Right => "right",
+            Align::Justify => "justified",
+        };
+        self.toast(format!("Text aligned {label}."));
+    }
+
+    fn action_line_break(&mut self) {
+        let Some(ed) = &mut self.editor else {
+            return;
+        };
+        let rev = ed.revision;
+        ed.insert_line_break();
+        if ed.revision != rev {
+            self.last_edit = Instant::now();
+            self.save_state = SaveState::Idle;
+        }
+    }
+
+    fn action_delete_selection(&mut self) {
+        let Some(ed) = &mut self.editor else {
+            return;
+        };
+        let rev = ed.revision;
+        ed.delete_selection();
+        if ed.revision != rev {
+            self.last_edit = Instant::now();
+            self.save_state = SaveState::Idle;
+        }
+    }
+
     fn action_redraw(&mut self) {
         self.redraw_requested = true;
         self.toast("Screen redrawn.");
@@ -2209,6 +2943,455 @@ impl App {
 
     fn action_about(&mut self) {
         self.overlay = Overlay::About;
+    }
+
+    fn action_notes(&mut self) {
+        if self.notes_loading || self.editor.is_none() {
+            return;
+        }
+        self.search = SearchState::default();
+        if self.notes_active {
+            self.leave_notes();
+        } else {
+            self.open_notes();
+        }
+    }
+
+    fn open_notes(&mut self) {
+        if let Some(notes) = self.notes_doc.take() {
+            self.flush_current_doc();
+            let main = self.take_doc_memory();
+            self.restore_doc_memory(notes);
+            self.notes_main = main;
+            self.notes_active = true;
+            self.toast("Notes.");
+            return;
+        }
+
+        self.flush_current_doc();
+        if let Some(path) = self.local_path.clone() {
+            let notes_path = notes_local_path(&path);
+            let created = !notes_path.exists();
+            let doc = if created {
+                let Some(editor) = &self.editor else {
+                    return;
+                };
+                let Ok(mut doc) = notes_document_from(&editor.doc.book) else {
+                    self.toast("Could not create the notes document.");
+                    return;
+                };
+                let Ok(bytes) = doc.to_bytes() else {
+                    self.toast("Could not create the notes document.");
+                    return;
+                };
+                if let Err(error) = atomic_write(&notes_path, &bytes) {
+                    self.toast(format!("Could not create notes: {error}"));
+                    return;
+                }
+                doc
+            } else {
+                let title = notes_path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Notes");
+                let bytes = match fs::read(&notes_path) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        self.toast(format!("Could not read notes: {error}"));
+                        return;
+                    }
+                };
+                match OdtDocument::from_bytes(&bytes, title) {
+                    Ok(doc) => doc,
+                    Err(error) => {
+                        self.toast(format!("Could not open notes: {error}"));
+                        return;
+                    }
+                }
+            };
+            let main = self.take_doc_memory();
+            self.install_editor(doc, Some(notes_path), None, None, false);
+            self.notes_main = main;
+            self.notes_active = true;
+            self.toast(if created { "Notes created." } else { "Notes." });
+            return;
+        }
+
+        let Some(remote) = self.remote_path.clone() else {
+            return;
+        };
+        let Some(editor) = &self.editor else {
+            return;
+        };
+        let created = match notes_document_from(&editor.doc.book) {
+            Ok(doc) => doc,
+            Err(error) => {
+                self.toast(format!("Could not create notes: {error}"));
+                return;
+            }
+        };
+        let notes_path = notes_remote_path(&remote);
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let tx = self.net_tx.clone();
+        self.pending_notes = Some(PendingNotes {
+            path: notes_path.clone(),
+            created,
+        });
+        self.notes_loading = true;
+        self.toast("Opening notes…");
+        std::thread::spawn(move || {
+            let result = client
+                .get_optional(&notes_path)
+                .map_err(|error| format!("{error}"));
+            let _ = tx.send(NetEvent::NotesFetched {
+                path: notes_path,
+                result,
+            });
+        });
+    }
+
+    fn finish_notes_fetch(&mut self, pending: PendingNotes, result: NotesFetchResult) {
+        self.notes_loading = false;
+        match result {
+            Ok(Some((bytes, etag))) => {
+                let title = notes_title(&pending.path);
+                match OdtDocument::from_bytes(&bytes, &title) {
+                    Ok(doc) => {
+                        self.swap_to_notes(doc, Some(pending.path), etag, false, false);
+                        self.toast("Notes.");
+                    }
+                    Err(error) => self.toast(format!("Could not open notes: {error}")),
+                }
+            }
+            Ok(None) => {
+                let mut created = pending.created;
+                let Ok(bytes) = created.to_bytes() else {
+                    self.toast("Could not create the notes document.");
+                    return;
+                };
+                self.write_cache(&pending.path, &bytes, None, true);
+                self.swap_to_notes(created, Some(pending.path), None, true, true);
+                self.toast("Notes created.");
+            }
+            Err(error) => self.toast(format!("Could not open notes: {error}")),
+        }
+    }
+
+    fn swap_to_notes(
+        &mut self,
+        doc: OdtDocument,
+        remote_path: Option<String>,
+        etag: Option<String>,
+        create_new: bool,
+        upload: bool,
+    ) {
+        let main = self.take_doc_memory();
+        self.install_editor(doc, None, remote_path, etag, create_new);
+        self.notes_main = main;
+        self.notes_active = true;
+        self.notes_loading = false;
+        self.pending_notes = None;
+        if upload {
+            self.save_remote_now();
+        }
+    }
+
+    fn leave_notes(&mut self) {
+        self.flush_current_doc();
+        self.notes_doc = self.take_doc_memory();
+        if let Some(main) = self.notes_main.take() {
+            self.restore_doc_memory(main);
+        }
+        self.notes_active = false;
+        self.toast("Back to document.");
+    }
+
+    fn flush_current_doc(&mut self) {
+        self.save_local_now();
+        if self.remote_path.is_some() && !self.net_busy {
+            self.save_remote_now();
+        }
+    }
+
+    fn take_doc_memory(&mut self) -> Option<DocMemory> {
+        let editor = self.editor.take()?;
+        Some(DocMemory {
+            editor,
+            local_path: self.local_path.take(),
+            remote_path: self.remote_path.take(),
+            etag: self.etag.take(),
+            create_new: self.create_new,
+            save_state: self.save_state.clone(),
+            conflict: self.conflict,
+        })
+    }
+
+    fn restore_doc_memory(&mut self, doc: DocMemory) {
+        let (width, height) = crossterm::terminal::size().unwrap_or((100, 40));
+        let mut editor = doc.editor;
+        editor.set_viewport(width, height);
+        editor.sync_page();
+        self.editor = Some(editor);
+        self.local_path = doc.local_path;
+        self.remote_path = doc.remote_path;
+        self.etag = doc.etag;
+        self.create_new = doc.create_new;
+        self.save_state = doc.save_state;
+        self.conflict = doc.conflict;
+        self.search = SearchState::default();
+        self.overlay = if self.conflict {
+            Overlay::Conflict
+        } else {
+            Overlay::None
+        };
+        self.input = None;
+        self.file_picker = None;
+        self.chapter_picker = None;
+        self.selection_menu = None;
+        self.pending_open = None;
+        self.force_remote_reload = false;
+        self.last_edit = Instant::now();
+        self.last_local_save = Instant::now();
+        self.last_remote_attempt = Instant::now();
+    }
+
+    fn update_parked_save(
+        &mut self,
+        path: &str,
+        etag: Option<String>,
+        rev: u64,
+        conflict: bool,
+        failed: bool,
+    ) -> Option<&'static str> {
+        if let Some(memory) = self.notes_main.as_mut()
+            && memory.remote_path.as_deref() == Some(path)
+        {
+            Self::apply_parked_save(memory, etag, rev, conflict, failed);
+            return Some("Document");
+        }
+        if let Some(memory) = self.notes_doc.as_mut()
+            && memory.remote_path.as_deref() == Some(path)
+        {
+            Self::apply_parked_save(memory, etag, rev, conflict, failed);
+            return Some("Notes");
+        }
+        None
+    }
+
+    fn apply_parked_save(
+        memory: &mut DocMemory,
+        etag: Option<String>,
+        rev: u64,
+        conflict: bool,
+        failed: bool,
+    ) {
+        if conflict {
+            memory.conflict = true;
+            memory.save_state = SaveState::Conflict;
+        } else if failed {
+            memory.save_state = SaveState::Offline;
+        } else if let Some(etag) = etag {
+            memory.etag = Some(etag);
+            memory.create_new = false;
+            if memory.editor.revision == rev {
+                memory.editor.mark_saved();
+                memory.save_state = SaveState::Saved;
+            } else {
+                memory.save_state = SaveState::Idle;
+            }
+        }
+    }
+
+    fn clear_notes_session(&mut self) {
+        self.notes_active = false;
+        self.notes_loading = false;
+        self.notes_main = None;
+        self.notes_doc = None;
+        self.pending_notes = None;
+    }
+
+    fn action_config(&mut self) {
+        let mut status = None;
+        let ai = match ai::load() {
+            Ok(Some(cfg)) => cfg,
+            Ok(None) => ai::AiConfig::default(),
+            Err(error) => {
+                status = Some((format!("Could not read ai.toml: {error}"), true));
+                ai::AiConfig::default()
+            }
+        };
+        let mut panel = ConfigPanel::new(ai, self.settings.theme);
+        panel.status = status;
+        self.config_panel = Some(panel);
+        self.overlay = Overlay::Config;
+    }
+
+    fn cancel_config(&mut self) {
+        if let Some(panel) = self.config_panel.take() {
+            self.set_theme(panel.original_theme);
+        }
+        if self.overlay == Overlay::Config {
+            self.overlay = Overlay::None;
+        }
+    }
+
+    fn set_theme(&mut self, theme: ThemeName) {
+        self.settings.theme = theme;
+        self.palette = theme.palette();
+    }
+
+    fn save_config(&mut self) {
+        let Some(panel) = &mut self.config_panel else {
+            return;
+        };
+        if panel.editing.is_some() {
+            panel.commit_edit();
+        }
+        if let Err(error) = panel.ai.validate() {
+            panel.set_status(format!("{error:#}"), true);
+            return;
+        }
+        let ai_config = panel.ai.clone();
+        if let Err(error) = ai::save(&ai_config) {
+            panel.set_status(format!("Could not save ai.toml: {error:#}"), true);
+            return;
+        }
+        if let Err(error) = settings::save(&self.settings) {
+            panel.set_status(format!("Could not save settings.toml: {error:#}"), true);
+            return;
+        }
+        self.config_panel = None;
+        self.overlay = Overlay::None;
+        self.toast("Configuration saved.");
+    }
+
+    fn test_config(&mut self) {
+        let Some(panel) = &mut self.config_panel else {
+            return;
+        };
+        if panel.testing {
+            return;
+        }
+        panel.testing = true;
+        panel.set_status("Testing the AI endpoint…", false);
+        let cfg = panel.ai.clone().effective();
+        let tx = self.ai_tx.clone();
+        std::thread::spawn(move || {
+            let result = ai::test_connection(&cfg).map_err(|error| format!("{error}"));
+            let _ = tx.send(AiEvent::TestDone { result });
+        });
+    }
+
+    fn handle_config_key(&mut self, key: KeyEvent) {
+        if self.config_panel.is_none() {
+            self.overlay = Overlay::None;
+            return;
+        }
+
+        if self
+            .config_panel
+            .as_ref()
+            .is_some_and(|panel| panel.editing.is_some())
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    if let Some(panel) = &mut self.config_panel {
+                        panel.editing = None;
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(panel) = &mut self.config_panel {
+                        panel.commit_edit();
+                    }
+                }
+                _ => {
+                    if let Some(panel) = &mut self.config_panel
+                        && let Some(input) = panel.editing.as_mut()
+                    {
+                        match key.code {
+                            KeyCode::Left => input.left(),
+                            KeyCode::Right => input.right(),
+                            KeyCode::Home => input.home(),
+                            KeyCode::End => input.end(),
+                            KeyCode::Backspace => input.backspace(),
+                            KeyCode::Delete => input.delete(),
+                            KeyCode::Char(ch) if key.modifiers == KeyModifiers::NONE => {
+                                input.insert(ch)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        let field = self
+            .config_panel
+            .as_ref()
+            .map(|panel| panel.field())
+            .unwrap_or(ConfigField::BaseUrl);
+        match key.code {
+            KeyCode::Esc => self.cancel_config(),
+            KeyCode::Up => {
+                if let Some(panel) = &mut self.config_panel {
+                    panel.selected = panel.selected.saturating_sub(1);
+                    panel.status = None;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(panel) = &mut self.config_panel {
+                    panel.selected = (panel.selected + 1).min(CONFIG_FIELDS.len() - 1);
+                    panel.status = None;
+                }
+            }
+            KeyCode::Left if field == ConfigField::Theme => {
+                let theme = self.settings.theme.prev();
+                self.set_theme(theme);
+            }
+            KeyCode::Right if field == ConfigField::Theme => {
+                let theme = self.settings.theme.next();
+                self.set_theme(theme);
+            }
+            KeyCode::Enter => match field {
+                ConfigField::JsonMode => {
+                    if let Some(panel) = &mut self.config_panel {
+                        panel.ai.json_mode = !panel.ai.json_mode;
+                    }
+                }
+                ConfigField::Theme => {
+                    let theme = self.settings.theme.next();
+                    self.set_theme(theme);
+                }
+                _ => {
+                    if let Some(panel) = &mut self.config_panel {
+                        panel.start_edit();
+                    }
+                }
+            },
+            KeyCode::Char(' ') if field == ConfigField::JsonMode => {
+                if let Some(panel) = &mut self.config_panel {
+                    panel.ai.json_mode = !panel.ai.json_mode;
+                }
+            }
+            KeyCode::Char(' ') if field == ConfigField::Theme => {
+                let theme = self.settings.theme.next();
+                self.set_theme(theme);
+            }
+            KeyCode::Delete if field == ConfigField::ApiKey => {
+                if let Some(panel) = &mut self.config_panel {
+                    panel.ai.api_key.clear();
+                    panel.set_status("API key cleared; press s to save.", false);
+                }
+            }
+            KeyCode::Char('s') if key.modifiers == KeyModifiers::NONE || ctrl(&key) => {
+                self.save_config()
+            }
+            KeyCode::Char('t') if key.modifiers == KeyModifiers::NONE => self.test_config(),
+            _ => {}
+        }
     }
 
     fn action_ai_check(&mut self) {
@@ -2378,6 +3561,24 @@ impl App {
                         }
                     }
                 }
+                AiEvent::TestDone { result } => {
+                    if let Some(panel) = &mut self.config_panel {
+                        panel.testing = false;
+                        match result {
+                            Ok(reply) => {
+                                panel.set_status(format!("Endpoint OK: {}", reply.trim()), false)
+                            }
+                            Err(error) => {
+                                panel.set_status(format!("Endpoint failed: {error}"), true)
+                            }
+                        }
+                    } else {
+                        match result {
+                            Ok(_) => self.toast("AI endpoint OK."),
+                            Err(error) => self.toast(format!("AI endpoint failed: {error}")),
+                        }
+                    }
+                }
             }
         }
     }
@@ -2392,6 +3593,61 @@ impl App {
         let (para, start) = (issue.para, issue.start);
         if let Some(ed) = &mut self.editor {
             ed.reveal(para, start);
+        }
+    }
+
+    fn handle_selection_key(&mut self, key: KeyEvent) {
+        let Some(menu) = self.selection_menu else {
+            self.overlay = Overlay::None;
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.selection_menu = None;
+                self.overlay = Overlay::None;
+            }
+            KeyCode::Up => {
+                if let Some(menu) = &mut self.selection_menu {
+                    menu.selected = menu.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(menu) = &mut self.selection_menu {
+                    menu.selected = (menu.selected + 1).min(SELECTION_ACTIONS.len() - 1);
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.run_selection_action(SELECTION_ACTIONS[menu.selected].1);
+            }
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                self.run_selection_action(SelectionAction::Bold);
+            }
+            KeyCode::Char('i') | KeyCode::Char('I') => {
+                self.run_selection_action(SelectionAction::Italic);
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                self.run_selection_action(SelectionAction::Underline);
+            }
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                self.run_selection_action(SelectionAction::Strike);
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+                self.run_selection_action(SelectionAction::Delete);
+            }
+            _ => {}
+        }
+    }
+
+    fn run_selection_action(&mut self, action: SelectionAction) {
+        self.selection_menu = None;
+        self.overlay = Overlay::None;
+        match action {
+            SelectionAction::Bold => self.action_bold(),
+            SelectionAction::Italic => self.action_italic(),
+            SelectionAction::Underline => self.action_underline(),
+            SelectionAction::Strike => self.action_strike(),
+            SelectionAction::Delete => self.action_delete_selection(),
+            SelectionAction::None => {}
         }
     }
 
@@ -2629,6 +3885,7 @@ impl App {
                     InputKind::SaveCopy => {
                         self.save_copy(&value);
                     }
+                    InputKind::ConfigField => {}
                 }
             }
             KeyCode::Backspace => input.backspace(),
@@ -2955,6 +4212,7 @@ impl App {
     }
 
     fn finish_create_remote_file(&mut self, path: String) {
+        self.clear_notes_session();
         let title = path
             .rsplit('/')
             .next()
@@ -3033,6 +4291,13 @@ impl App {
     }
 
     fn try_quit(&mut self) {
+        if self.notes_active {
+            self.leave_notes();
+            if self.net_busy {
+                self.toast("Saving notes… try again in a moment.");
+                return;
+            }
+        }
         if self.lock_pending.is_some() {
             self.toast("Waiting for the lock operation to finish.");
             return;
@@ -3105,6 +4370,7 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        let p = self.palette;
         let area = frame.area();
         let menu_height = 1u16.min(area.height);
         let panel_height = self.ai_panel_height(area.height);
@@ -3127,7 +4393,7 @@ impl App {
                 .saturating_sub(1),
         };
         frame.render_widget(Clear, editor_area);
-        fill_default_bg(frame.buffer_mut(), editor_area, EDITOR_BG);
+        fill_default_bg(frame.buffer_mut(), editor_area, p.editor_bg);
         if let Some(ed) = &self.editor {
             self.draw_editor(frame, ed, editor_area);
         } else {
@@ -3150,11 +4416,14 @@ impl App {
             Overlay::LockWaiting => self.draw_lock_waiting(frame),
             Overlay::LockForce => self.draw_lock_force(frame),
             Overlay::AiPanel => {}
+            Overlay::Config => self.draw_config(frame),
+            Overlay::Selection => self.draw_selection_menu(frame),
             Overlay::About => self.draw_about(frame),
         }
     }
 
     fn draw_menu_bar(&self, frame: &mut Frame, area: Rect) {
+        let p = self.palette;
         if area.height == 0 {
             return;
         }
@@ -3164,7 +4433,7 @@ impl App {
             width: area.width,
             height: 1,
         };
-        fill_bg(frame.buffer_mut(), rect, PANEL_BG);
+        fill_bg(frame.buffer_mut(), rect, p.bar_bg);
         let buf = frame.buffer_mut();
         let mut x = area.x + 1;
         for (idx, menu) in MENUS.iter().enumerate() {
@@ -3175,11 +4444,11 @@ impl App {
             }
             let style = if self.overlay == Overlay::Menu && idx == self.menu.active {
                 Style::default()
-                    .bg(ACCENT)
-                    .fg(EDITOR_BG)
+                    .bg(p.accent)
+                    .fg(p.editor_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().bg(PANEL_BG).fg(PLAIN)
+                Style::default().bg(p.bar_bg).fg(p.plain)
             };
             buf.set_stringn(x, rect.y, &text, width as usize, style);
             x += width;
@@ -3193,12 +4462,13 @@ impl App {
                 rect.y,
                 hint,
                 hint_width as usize,
-                Style::default().bg(PANEL_BG).fg(DIM),
+                Style::default().bg(p.bar_bg).fg(p.dim),
             );
         }
     }
 
     fn draw_ai_panel(&self, frame: &mut Frame, area: Rect, height: u16) {
+        let p = self.palette;
         let Some(panel) = &self.ai_panel else {
             return;
         };
@@ -3213,12 +4483,12 @@ impl App {
         for y in rect.y..rect.y + rect.height {
             for x in rect.x..rect.x + rect.width {
                 buf[(x, y)].set_char(' ');
-                buf[(x, y)].set_style(Style::default().bg(PANEL_BG).fg(PLAIN));
+                buf[(x, y)].set_style(Style::default().bg(p.panel_bg).fg(p.plain));
             }
         }
         for x in rect.x..rect.x + rect.width {
             buf[(x, rect.y)].set_char('─');
-            buf[(x, rect.y)].set_style(Style::default().bg(PANEL_BG).fg(PAGE_BORDER));
+            buf[(x, rect.y)].set_style(Style::default().bg(p.panel_bg).fg(p.page_border));
         }
 
         let header = match panel.status {
@@ -3243,8 +4513,8 @@ impl App {
             &header,
             rect.width as usize,
             Style::default()
-                .bg(PANEL_BG)
-                .fg(HEADING)
+                .bg(p.panel_bg)
+                .fg(p.heading)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -3267,21 +4537,21 @@ impl App {
             footer_y,
             footer,
             rect.width as usize,
-            Style::default().bg(PANEL_BG).fg(DIM),
+            Style::default().bg(p.panel_bg).fg(p.dim),
         );
 
         if panel.status != AiStatus::Ready {
             let color = if panel.status == AiStatus::Error {
-                ERR
+                p.error
             } else {
-                ACCENT
+                p.accent
             };
             buf.set_stringn(
                 rect.x + 1,
                 rect.y + 1,
                 &panel.message,
                 rect.width.saturating_sub(2) as usize,
-                Style::default().bg(PANEL_BG).fg(color),
+                Style::default().bg(p.panel_bg).fg(color),
             );
             return;
         }
@@ -3292,7 +4562,7 @@ impl App {
                 rect.y + 1,
                 &panel.message,
                 rect.width.saturating_sub(2) as usize,
-                Style::default().bg(PANEL_BG).fg(GOOD),
+                Style::default().bg(p.panel_bg).fg(p.good),
             );
             return;
         }
@@ -3314,13 +4584,13 @@ impl App {
             let selected = index == panel.selected;
             let style = if selected {
                 Style::default()
-                    .bg(SELECT_BG)
-                    .fg(Color::White)
+                    .bg(p.select_bg)
+                    .fg(p.select_fg)
                     .add_modifier(Modifier::BOLD)
             } else if issue.severity == "warning" {
-                Style::default().bg(PANEL_BG).fg(ACCENT)
+                Style::default().bg(p.panel_bg).fg(p.accent)
             } else {
-                Style::default().bg(PANEL_BG).fg(PLAIN)
+                Style::default().bg(p.panel_bg).fg(p.plain)
             };
             for x in rect.x..rect.x + rect.width {
                 buf[(x, y)].set_char(' ');
@@ -3370,13 +4640,282 @@ impl App {
             frame.render_widget(
                 Paragraph::new(detail)
                     .wrap(Wrap { trim: false })
-                    .style(Style::default().bg(PANEL_BG).fg(DIM)),
+                    .style(Style::default().bg(p.panel_bg).fg(p.dim)),
                 detail_area,
             );
         }
     }
 
+    fn draw_config(&self, frame: &mut Frame) {
+        let p = self.palette;
+        let Some(panel) = &self.config_panel else {
+            return;
+        };
+        let area = frame.area();
+        let height = 19.min(area.height);
+        let rect = centered(area, 88.min(area.width), height);
+        frame.render_widget(Clear, rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(p.page_border))
+            .title(" Configuration ")
+            .title_style(Style::default().fg(p.heading));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+
+        let buf = frame.buffer_mut();
+        let footer_y = inner.y + inner.height - 1;
+        let status_y = footer_y.saturating_sub(1);
+        let field_bottom = status_y.saturating_sub(1);
+        let label_w = 14u16;
+        let value_x = inner.x + label_w;
+        let value_w = inner.width.saturating_sub(label_w);
+        let mut y = inner.y;
+
+        if y < field_bottom {
+            buf.set_stringn(
+                inner.x,
+                y,
+                " AI writing check",
+                inner.width as usize,
+                Style::default()
+                    .bg(p.panel_bg)
+                    .fg(p.heading)
+                    .add_modifier(Modifier::BOLD),
+            );
+            y += 1;
+        }
+        for (index, field) in CONFIG_FIELDS.iter().take(6).enumerate() {
+            if y >= field_bottom {
+                break;
+            }
+            let selected = index == panel.selected;
+            let editing = selected && panel.editing.is_some();
+            let row_style = if selected {
+                Style::default()
+                    .bg(p.select_bg)
+                    .fg(p.select_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(p.panel_bg).fg(p.plain)
+            };
+            for x in inner.x..inner.x + inner.width {
+                buf[(x, y)].set_char(' ');
+                buf[(x, y)].set_style(row_style);
+            }
+            buf.set_stringn(
+                inner.x + 1,
+                y,
+                field.label(),
+                label_w as usize,
+                Style::default()
+                    .bg(if selected { p.select_bg } else { p.panel_bg })
+                    .fg(if selected { p.select_fg } else { p.dim }),
+            );
+            let value = if let Some(input) = panel.editing.as_ref().filter(|_| editing) {
+                if *field == ConfigField::ApiKey {
+                    panel.display_key()
+                } else {
+                    input.value.clone()
+                }
+            } else {
+                panel.display_value(*field)
+            };
+            buf.set_stringn(value_x, y, &value, value_w as usize, row_style);
+            if editing {
+                let cursor_chars = panel
+                    .editing
+                    .as_ref()
+                    .map(|input| input.cursor.min(40))
+                    .unwrap_or(0);
+                let cx = value_x + cursor_chars as u16;
+                if cx < inner.x + inner.width {
+                    buf[(cx, y)].set_style(Style::default().bg(p.cursor_bg).fg(p.cursor_fg));
+                }
+            }
+            y += 1;
+        }
+
+        if y < field_bottom {
+            y += 1;
+        }
+        if y < field_bottom {
+            buf.set_stringn(
+                inner.x,
+                y,
+                " Appearance",
+                inner.width as usize,
+                Style::default()
+                    .bg(p.panel_bg)
+                    .fg(p.heading)
+                    .add_modifier(Modifier::BOLD),
+            );
+            y += 1;
+        }
+        let theme_index = CONFIG_FIELDS.len() - 1;
+        if y < field_bottom {
+            let selected = panel.selected == theme_index;
+            let row_style = if selected {
+                Style::default()
+                    .bg(p.select_bg)
+                    .fg(p.select_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(p.panel_bg).fg(p.plain)
+            };
+            for x in inner.x..inner.x + inner.width {
+                buf[(x, y)].set_char(' ');
+                buf[(x, y)].set_style(row_style);
+            }
+            buf.set_stringn(
+                inner.x + 1,
+                y,
+                ConfigField::Theme.label(),
+                label_w as usize,
+                Style::default()
+                    .bg(if selected { p.select_bg } else { p.panel_bg })
+                    .fg(if selected { p.select_fg } else { p.dim }),
+            );
+            let theme = if selected {
+                format!("◀ {} ▶", self.settings.theme.label())
+            } else {
+                self.settings.theme.label().to_string()
+            };
+            buf.set_stringn(value_x, y, &theme, value_w as usize, row_style);
+        }
+
+        if status_y < footer_y {
+            if let Some((message, error)) = &panel.status {
+                let color = if *error { p.error } else { p.good };
+                buf.set_stringn(
+                    inner.x + 1,
+                    status_y,
+                    message,
+                    inner.width.saturating_sub(2) as usize,
+                    Style::default().fg(color),
+                );
+            } else if std::env::var_os("SCRIBE_AI_API_KEY").is_some() {
+                buf.set_stringn(
+                    inner.x + 1,
+                    status_y,
+                    "SCRIBE_AI_API_KEY is set and overrides the saved key",
+                    inner.width.saturating_sub(2) as usize,
+                    Style::default().fg(p.dim),
+                );
+            }
+        }
+
+        let (footer, footer_color) = if panel.editing.is_some() {
+            (
+                "Type a new value · Enter confirm · Esc cancel · key stays masked",
+                p.dim,
+            )
+        } else if panel.testing {
+            ("Testing the AI endpoint…", p.accent)
+        } else {
+            (
+                "↑↓ move · Enter edit/toggle · ←→ theme · s save · t test · Esc cancel",
+                p.dim,
+            )
+        };
+        buf.set_stringn(
+            inner.x + 1,
+            footer_y,
+            footer,
+            inner.width.saturating_sub(2) as usize,
+            Style::default().fg(footer_color),
+        );
+    }
+
+    fn draw_selection_menu(&self, frame: &mut Frame) {
+        let p = self.palette;
+        let Some(menu) = &self.selection_menu else {
+            return;
+        };
+        let area = frame.area();
+        let height = (SELECTION_ACTIONS.len() as u16 + 6).min(area.height);
+        let rect = centered(area, 52.min(area.width), height);
+        frame.render_widget(Clear, rect);
+        let count = self
+            .editor
+            .as_ref()
+            .map(|editor| editor.selection_len())
+            .unwrap_or(0);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(p.page_border))
+            .title(" Selection ")
+            .title_style(Style::default().fg(p.heading));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
+        if inner.height == 0 || inner.width == 0 {
+            return;
+        }
+        let buf = frame.buffer_mut();
+        let footer_y = inner.y + inner.height - 1;
+        buf.set_stringn(
+            inner.x,
+            inner.y,
+            format!(" {count} characters selected"),
+            inner.width as usize,
+            Style::default().fg(p.dim),
+        );
+        for (index, (label, action)) in SELECTION_ACTIONS.iter().enumerate() {
+            let y = inner.y + 2 + index as u16;
+            if y >= footer_y {
+                break;
+            }
+            let selected = index == menu.selected;
+            let row_style = if selected {
+                Style::default()
+                    .bg(p.select_bg)
+                    .fg(p.select_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().bg(p.panel_bg).fg(p.plain)
+            };
+            for x in inner.x..inner.x + inner.width {
+                buf[(x, y)].set_char(' ');
+                buf[(x, y)].set_style(row_style);
+            }
+            buf.set_stringn(inner.x + 1, y, label, inner.width as usize, row_style);
+            let hint = match action {
+                SelectionAction::Bold => "B",
+                SelectionAction::Italic => "I",
+                SelectionAction::Underline => "U",
+                SelectionAction::Strike => "S",
+                SelectionAction::Delete => "D",
+                SelectionAction::None => "Esc",
+            };
+            let hint_width = text_width(hint) as u16;
+            if hint_width + 2 < inner.width {
+                buf.set_stringn(
+                    inner.x + inner.width - hint_width - 1,
+                    y,
+                    hint,
+                    hint_width as usize,
+                    Style::default()
+                        .bg(if selected { p.select_bg } else { p.panel_bg })
+                        .fg(p.dim),
+                );
+            }
+        }
+        buf.set_stringn(
+            inner.x + 1,
+            footer_y,
+            "↑↓ choose · Enter apply · Esc keeps selection",
+            inner.width.saturating_sub(2) as usize,
+            Style::default().fg(p.dim),
+        );
+    }
+
     fn draw_menu_dropdown(&self, frame: &mut Frame, area: Rect) {
+        let p = self.palette;
         if area.height < 2 {
             return;
         }
@@ -3404,17 +4943,17 @@ impl App {
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(PAGE_BORDER))
-            .style(Style::default().bg(PANEL_BG));
+            .border_style(Style::default().fg(p.page_border))
+            .style(Style::default().bg(p.bar_bg));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
-        fill_bg(frame.buffer_mut(), inner, PANEL_BG);
+        fill_bg(frame.buffer_mut(), inner, p.bar_bg);
         let buf = frame.buffer_mut();
         for (row, entry) in menu.entries.iter().take(inner.height as usize).enumerate() {
             let y = inner.y + row as u16;
             match entry {
                 MenuEntry::Separator => {
-                    let style = Style::default().bg(PANEL_BG).fg(PAGE_BORDER);
+                    let style = Style::default().bg(p.bar_bg).fg(p.page_border);
                     for x in inner.x..inner.x + inner.width {
                         buf[(x, y)].set_char('─');
                         buf[(x, y)].set_style(style);
@@ -3428,11 +4967,11 @@ impl App {
                     let enabled = self.menu_item_enabled(*action);
                     let selected = row == self.menu.selected;
                     let row_style = if selected {
-                        Style::default().bg(SELECT_BG).fg(Color::Rgb(255, 255, 255))
+                        Style::default().bg(p.select_bg).fg(p.select_fg)
                     } else if enabled {
-                        Style::default().bg(PANEL_BG).fg(PLAIN)
+                        Style::default().bg(p.bar_bg).fg(p.plain)
                     } else {
-                        Style::default().bg(PANEL_BG).fg(DIM)
+                        Style::default().bg(p.bar_bg).fg(p.dim)
                     };
                     for x in inner.x..inner.x + inner.width {
                         buf[(x, y)].set_char(' ');
@@ -3449,13 +4988,13 @@ impl App {
                         let shortcut_x = inner.x + inner.width.saturating_sub(shortcut_width + 1);
                         let label_end = inner.x + 1 + text_width(label) as u16;
                         if shortcut_x > label_end {
-                            let shortcut_bg = if selected { SELECT_BG } else { PANEL_BG };
+                            let shortcut_bg = if selected { p.select_bg } else { p.bar_bg };
                             buf.set_stringn(
                                 shortcut_x,
                                 y,
                                 shortcut,
                                 shortcut_width as usize,
-                                Style::default().bg(shortcut_bg).fg(DIM),
+                                Style::default().bg(shortcut_bg).fg(p.dim),
                             );
                         }
                     }
@@ -3465,6 +5004,7 @@ impl App {
     }
 
     fn draw_editor(&self, frame: &mut Frame, ed: &Editor, area: Rect) {
+        let p = self.palette;
         let width = area.width as usize;
         let tw = ed.text_width();
         let margin = width.saturating_sub(tw) / 2;
@@ -3485,7 +5025,7 @@ impl App {
             width: page_w as u16,
             height: area.height,
         };
-        fill_bg(frame.buffer_mut(), page_rect, PAGE_BG);
+        fill_bg(frame.buffer_mut(), page_rect, p.page_bg);
         let buf = frame.buffer_mut();
         let page_start = ed.page_start();
         for (row, line) in ed.page_lines().iter().enumerate() {
@@ -3509,30 +5049,33 @@ impl App {
                         }
                         buf[(x, y)].set_char(ch);
                         buf[(x, y)]
-                            .set_style(Style::default().fg(HEADING).add_modifier(Modifier::BOLD));
+                            .set_style(Style::default().fg(p.heading).add_modifier(Modifier::BOLD));
                         x += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1) as u16;
                     }
                 }
                 LineKind::Para => {
                     let para = &ed.doc.book.chapters[ed.current_chapter()].paragraphs[line.para];
+                    let subheading = para.kind == ParaKind::Subheading;
                     let mut x = (margin + line.indent) as u16;
                     for (i, c) in para.chars[line.start..line.end].iter().enumerate() {
                         if x >= area.x + area.width {
                             break;
                         }
-                        let color = if c.bold && c.italic {
-                            BOTH_C
+                        let color = if subheading {
+                            p.heading
+                        } else if c.bold && c.italic {
+                            p.both
                         } else if c.bold {
-                            BOLD_C
+                            p.bold
                         } else if c.italic {
-                            ITALIC_C
+                            p.italic
                         } else {
-                            PLAIN
+                            p.plain
                         };
                         let mut style = Style::default().fg(color);
                         let selected = ed.is_selected(line.para, line.start + i);
                         if selected {
-                            style = style.bg(SELECTION_BG);
+                            style = style.bg(p.selection_bg);
                         }
                         if !selected
                             && self.overlay == Overlay::AiPanel
@@ -3548,17 +5091,34 @@ impl App {
                                 })
                             {
                                 style = style.bg(if index == panel.selected {
-                                    AI_FOCUS_BG
+                                    p.ai_focus_bg
                                 } else {
-                                    AI_ISSUE_BG
+                                    p.ai_issue_bg
                                 });
                             }
                         }
-                        if c.bold {
+                        if self.search.active
+                            && let Some(index) = self.search.current
+                            && let Some(found) = self.search.matches.get(index)
+                            && found.chapter == ed.current_chapter()
+                            && found.para == line.para
+                        {
+                            let offset = line.start + i;
+                            if offset >= found.start && offset < found.end {
+                                style = style.bg(p.selection_bg);
+                            }
+                        }
+                        if c.bold || subheading {
                             style = style.add_modifier(Modifier::BOLD);
                         }
                         if c.italic {
                             style = style.add_modifier(Modifier::ITALIC);
+                        }
+                        if c.underline {
+                            style = style.add_modifier(Modifier::UNDERLINED);
+                        }
+                        if c.strike {
+                            style = style.add_modifier(Modifier::CROSSED_OUT);
                         }
                         buf[(x, y)].set_char(c.ch);
                         buf[(x, y)].set_style(style);
@@ -3574,14 +5134,14 @@ impl App {
                 let x = (margin - 1) as u16;
                 for y in area.y..area.y.saturating_add(area.height) {
                     buf[(x, y)].set_char('│');
-                    buf[(x, y)].set_style(Style::default().fg(PAGE_BORDER).bg(PAGE_BG));
+                    buf[(x, y)].set_style(Style::default().fg(p.page_border).bg(p.page_bg));
                 }
             }
             if has_right {
                 let x = (margin + tw) as u16;
                 for y in area.y..area.y.saturating_add(area.height) {
                     buf[(x, y)].set_char('│');
-                    buf[(x, y)].set_style(Style::default().fg(PAGE_BORDER).bg(PAGE_BG));
+                    buf[(x, y)].set_style(Style::default().fg(p.page_border).bg(p.page_bg));
                 }
             }
         }
@@ -3594,28 +5154,29 @@ impl App {
             let x = (margin + cp.col).min(width.saturating_sub(1)) as u16;
             let y = area.y + row as u16;
             let cell = &mut frame.buffer_mut()[(x, y)];
-            cell.set_style(Style::default().bg(Color::White).fg(Color::Black));
+            cell.set_style(Style::default().bg(p.cursor_bg).fg(p.cursor_fg));
         }
     }
 
     fn draw_empty(&self, frame: &mut Frame, area: Rect) {
+        let p = self.palette;
         let text = vec![
             Line::from(Span::styled(
                 "scribe",
-                Style::default().fg(HEADING).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.heading).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "Ctrl+O  open a book from Nextcloud",
-                Style::default().fg(PLAIN),
+                Style::default().fg(p.plain),
             )),
             Line::from(Span::styled(
                 "Ctrl+N  new chapter after opening a book",
-                Style::default().fg(PLAIN),
+                Style::default().fg(p.plain),
             )),
             Line::from(Span::styled(
                 "F9 menu · Alt+H help",
-                Style::default().fg(DIM),
+                Style::default().fg(p.dim),
             )),
         ];
         let w = 60.min(area.width);
@@ -3624,16 +5185,17 @@ impl App {
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(DIM))
+            .border_style(Style::default().fg(p.dim))
             .title(" scribe ")
-            .title_style(Style::default().fg(HEADING));
+            .title_style(Style::default().fg(p.heading));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         frame.render_widget(Paragraph::new(text), inner);
-        fill_default_bg(frame.buffer_mut(), rect, PANEL_BG);
+        fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
     }
 
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
+        let p = self.palette;
         let rect = Rect {
             x: 0,
             y: area.height.saturating_sub(1),
@@ -3643,29 +5205,88 @@ impl App {
         let buf = frame.buffer_mut();
         for x in rect.x..rect.x + rect.width {
             buf[(x, rect.y)].set_char(' ');
-            buf[(x, rect.y)].set_style(Style::default().bg(PANEL_BG).fg(DIM));
+            buf[(x, rect.y)].set_style(Style::default().bg(p.bar_bg).fg(p.dim));
+        }
+        if self.search.active {
+            let prefix = " Find: ";
+            let prefix_width = text_width(prefix) as u16;
+            buf.set_stringn(
+                rect.x,
+                rect.y,
+                prefix,
+                rect.width as usize,
+                Style::default().bg(p.bar_bg).fg(p.dim),
+            );
+            let max = search_query_capacity(rect.width);
+            let mut x = rect.x + prefix_width;
+            let mut used = 0usize;
+            for ch in self.search.query.chars() {
+                let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if used + width > max || x >= rect.x + rect.width {
+                    break;
+                }
+                buf[(x, rect.y)].set_char(ch);
+                buf[(x, rect.y)].set_style(Style::default().bg(p.bar_bg).fg(p.plain));
+                x += width as u16;
+                used += width;
+            }
+            let cursor_width: usize = self
+                .search
+                .query
+                .chars()
+                .take(self.search.cursor)
+                .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+                .sum();
+            let caret_x = rect.x + prefix_width + cursor_width.min(max) as u16;
+            if caret_x < rect.x + rect.width {
+                buf[(caret_x, rect.y)].set_style(Style::default().bg(p.cursor_bg).fg(p.cursor_fg));
+            }
+            let status = if self.search.no_match {
+                Some(("No match".to_string(), p.error))
+            } else {
+                self.search.current.map(|index| {
+                    (
+                        format!("{}/{}", index + 1, self.search.matches.len()),
+                        p.heading,
+                    )
+                })
+            };
+            if let Some((text, color)) = status {
+                let width = text_width(&text) as u16;
+                if rect.width > prefix_width + width + 1 {
+                    let x = rect.x + rect.width - width - 1;
+                    buf.set_stringn(
+                        x,
+                        rect.y,
+                        &text,
+                        width as usize,
+                        Style::default().bg(p.bar_bg).fg(color),
+                    );
+                }
+            }
+            return;
         }
         let mut spans: Vec<Span> = Vec::new();
         if let Some((msg, _)) = &self.toast {
-            spans.push(Span::styled(msg.clone(), Style::default().fg(ACCENT)));
-            spans.push(Span::styled("  │  ", Style::default().fg(DIM)));
+            spans.push(Span::styled(msg.clone(), Style::default().fg(p.accent)));
+            spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
         }
         if let Some(ed) = &self.editor {
             spans.push(Span::styled(
                 format!("{} words", fmt_num(ed.total_words)),
-                Style::default().fg(PLAIN),
+                Style::default().fg(p.plain),
             ));
-            spans.push(Span::styled(" · ", Style::default().fg(DIM)));
+            spans.push(Span::styled(" · ", Style::default().fg(p.dim)));
             spans.push(Span::styled(
                 format!("{} chars", fmt_num(ed.total_chars)),
-                Style::default().fg(PLAIN),
+                Style::default().fg(p.plain),
             ));
-            spans.push(Span::styled(" · ", Style::default().fg(DIM)));
+            spans.push(Span::styled(" · ", Style::default().fg(p.dim)));
             spans.push(Span::styled(
                 format!("{} pages", fmt_num(ed.total_pages)),
-                Style::default().fg(PLAIN),
+                Style::default().fg(p.plain),
             ));
-            spans.push(Span::styled("  │  ", Style::default().fg(DIM)));
+            spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
             spans.push(Span::styled(
                 format!(
                     "Ch {}/{}  p {}/{}",
@@ -3674,117 +5295,159 @@ impl App {
                     ed.current_page() + 1,
                     ed.current_chapter_pages()
                 ),
-                Style::default().fg(HEADING),
+                Style::default().fg(p.heading),
             ));
-            spans.push(Span::styled("  │  ", Style::default().fg(DIM)));
+            spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
             spans.push(Span::styled(
                 self.save_state.text().to_string(),
-                Style::default().fg(self.save_state.color()),
+                Style::default().fg(self.save_state.color(p)),
             ));
             if ed.has_selection() {
-                spans.push(Span::styled("  │  ", Style::default().fg(DIM)));
+                spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
                 spans.push(Span::styled(
                     format!("SEL {}", fmt_num(ed.selection_len())),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
                 ));
             }
-            let (b, i) = ed.status_style();
-            if b || i {
-                spans.push(Span::styled("  │  ", Style::default().fg(DIM)));
-                if b && i {
-                    spans.push(Span::styled("B+I", Style::default().fg(BOTH_C)));
-                } else if b {
-                    spans.push(Span::styled("B", Style::default().fg(BOLD_C)));
-                } else {
-                    spans.push(Span::styled("I", Style::default().fg(ITALIC_C)));
+            let style = ed.status_style();
+            let mut marks: Vec<(&str, Color)> = Vec::new();
+            if style.bold {
+                marks.push(("B", p.bold));
+            }
+            if style.italic {
+                marks.push(("I", p.italic));
+            }
+            if style.underline {
+                marks.push(("U", p.heading));
+            }
+            if style.strike {
+                marks.push(("S", p.both));
+            }
+            if !marks.is_empty() {
+                spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
+                for (index, (label, color)) in marks.into_iter().enumerate() {
+                    if index > 0 {
+                        spans.push(Span::styled("+", Style::default().fg(p.dim)));
+                    }
+                    spans.push(Span::styled(label, Style::default().fg(color)));
                 }
             }
             if ed.pending_style.is_some() {
-                spans.push(Span::styled("*", Style::default().fg(ACCENT)));
+                spans.push(Span::styled("*", Style::default().fg(p.accent)));
             }
-            spans.push(Span::styled("  │  ", Style::default().fg(DIM)));
+            if self.notes_active {
+                spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
+                spans.push(Span::styled(
+                    "NOTES",
+                    Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+                ));
+            }
+            if ed.current_is_subheading() {
+                spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
+                spans.push(Span::styled(
+                    "H3",
+                    Style::default().fg(p.heading).add_modifier(Modifier::BOLD),
+                ));
+            }
+            let alignment = ed.current_alignment();
+            if alignment != Align::Justify {
+                spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
+                let label = match alignment {
+                    Align::Left => "ALIGN L",
+                    Align::Center => "ALIGN C",
+                    Align::Right => "ALIGN R",
+                    Align::Justify => "",
+                };
+                spans.push(Span::styled(label, Style::default().fg(p.accent)));
+            }
+            spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
             spans.push(Span::styled(
                 ed.doc.book.title.clone(),
-                Style::default().fg(HEADING).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.heading).add_modifier(Modifier::BOLD),
             ));
         } else {
             spans.push(Span::styled(
                 "F9 menu  ·  Ctrl+O open  ·  Alt+H help",
-                Style::default().fg(DIM),
+                Style::default().fg(p.dim),
             ));
         }
         frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(PANEL_BG)),
+            Paragraph::new(Line::from(spans)).style(Style::default().bg(p.bar_bg)),
             rect,
         );
     }
 
     fn draw_about(&self, frame: &mut Frame) {
+        let p = self.palette;
         let area = frame.area();
         let rect = centered(area, 68.min(area.width), 16.min(area.height));
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(DIM))
+            .border_style(Style::default().fg(p.dim))
             .title(" About scribe ")
-            .title_style(Style::default().fg(HEADING));
+            .title_style(Style::default().fg(p.heading));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let lines = vec![
             Line::from(Span::styled(
                 format!("scribe {}", app_version()),
-                Style::default().fg(HEADING).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.heading).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
             Line::from("A focused terminal editor for long-form prose"),
             Line::from("stored as ODT in Nextcloud."),
             Line::from(""),
             Line::from(vec![
-                Span::styled("Author       ", Style::default().fg(DIM)),
+                Span::styled("Author       ", Style::default().fg(p.dim)),
                 Span::raw(APP_AUTHOR),
             ]),
             Line::from(vec![
-                Span::styled("Repository   ", Style::default().fg(DIM)),
+                Span::styled("Repository   ", Style::default().fg(p.dim)),
                 Span::raw(APP_REPO),
             ]),
             Line::from(vec![
-                Span::styled("License      ", Style::default().fg(DIM)),
+                Span::styled("License      ", Style::default().fg(p.dim)),
                 Span::raw(APP_LICENSE),
             ]),
             Line::from(""),
             Line::from(vec![
-                Span::styled("Local files  ", Style::default().fg(DIM)),
+                Span::styled("Local files  ", Style::default().fg(p.dim)),
                 Span::raw("scribe open book.odt"),
             ]),
             Line::from(vec![
-                Span::styled("Nextcloud    ", Style::default().fg(DIM)),
+                Span::styled("Nextcloud    ", Style::default().fg(p.dim)),
                 Span::raw("optional — scribe login <url>"),
             ]),
             Line::from(""),
-            Line::from(Span::styled("Esc / Alt+A close", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "Esc / Alt+A close",
+                Style::default().fg(p.dim),
+            )),
         ];
         frame.render_widget(
-            Paragraph::new(lines).style(Style::default().fg(PLAIN)),
+            Paragraph::new(lines).style(Style::default().fg(p.plain)),
             inner,
         );
-        fill_default_bg(frame.buffer_mut(), rect, PANEL_BG);
+        fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
     }
 
     fn draw_help(&self, frame: &mut Frame) {
+        let p = self.palette;
         let area = frame.area();
-        let rect = centered(area, 74.min(area.width), 28.min(area.height));
+        let rect = centered(area, 76.min(area.width), 33.min(area.height));
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(DIM))
+            .border_style(Style::default().fg(p.dim))
             .title(" Help ")
-            .title_style(Style::default().fg(HEADING));
+            .title_style(Style::default().fg(p.heading));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let lines = vec![
             Line::from(Span::styled(
                 "Editing",
-                Style::default().fg(HEADING).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.heading).add_modifier(Modifier::BOLD),
             )),
             Line::from("Enter new paragraph          Backspace merge/delete"),
             Line::from("Ctrl+W delete word           Ctrl+Delete delete next word"),
@@ -3792,19 +5455,22 @@ impl App {
             Line::from("Ctrl+Shift+K delete paragraph"),
             Line::from("Ctrl+Z undo                  Ctrl+Y redo"),
             Line::from("Ctrl+Space mark start/end    Esc clear selection"),
+            Line::from("Shift/Alt+Enter line break  Finish mark = selection menu"),
             Line::from(""),
             Line::from(Span::styled(
                 "Formatting",
-                Style::default().fg(HEADING).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.heading).add_modifier(Modifier::BOLD),
             )),
-            Line::from("Ctrl+B / Alt+B bold word     Alt+I italic word  (orange / purple)"),
-            Line::from("B* / I* means the style applies to the next typed text"),
+            Line::from("Ctrl+B / Alt+B bold word     Alt+I italic word"),
+            Line::from("Alt+U underline              Alt+S strikethrough"),
+            Line::from("B* / I* / U* / S* applies to the next typed text"),
+            Line::from("H3 subheading and alignment are in the Edit menu"),
             Line::from("Typing \" or ' becomes curly based on surrounding text"),
             Line::from("New sentences capitalize the first typed letter"),
             Line::from(""),
             Line::from(Span::styled(
                 "Chapters",
-                Style::default().fg(HEADING).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.heading).add_modifier(Modifier::BOLD),
             )),
             Line::from("Ctrl+N new chapter           Ctrl+T edit chapter title"),
             Line::from("Ctrl+E edit book title"),
@@ -3812,23 +5478,26 @@ impl App {
             Line::from(""),
             Line::from(Span::styled(
                 "Files and navigation",
-                Style::default().fg(HEADING).add_modifier(Modifier::BOLD),
+                Style::default().fg(p.heading).add_modifier(Modifier::BOLD),
             )),
             Line::from("Ctrl+O open from Nextcloud   Ctrl+S save now"),
-            Line::from("F8 AI writing check          F9 menu bar"),
+            Line::from("F3 find                      Ctrl+, configuration"),
+            Line::from("F7 notes sidecar             F8 AI writing check"),
+            Line::from("F9 menu bar · themes: Tools → Configuration"),
             Line::from("Alt+H help / Alt+A about    PgUp/PgDn page"),
             Line::from("Ctrl+Home/End chapter start/end"),
             Line::from("Ctrl+L full redraw            Ctrl+Q quit"),
             Line::from("Esc close menu/help"),
         ];
         frame.render_widget(
-            Paragraph::new(lines).style(Style::default().fg(PLAIN)),
+            Paragraph::new(lines).style(Style::default().fg(p.plain)),
             inner,
         );
-        fill_default_bg(frame.buffer_mut(), rect, PANEL_BG);
+        fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
     }
 
     fn draw_chapter_picker(&self, frame: &mut Frame) {
+        let p = self.palette;
         let area = frame.area();
         let Some(ed) = &self.editor else {
             return;
@@ -3841,9 +5510,9 @@ impl App {
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(DIM))
+            .border_style(Style::default().fg(p.dim))
             .title(" Goto chapter ")
-            .title_style(Style::default().fg(HEADING));
+            .title_style(Style::default().fg(p.heading));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let visible_h = inner.height.saturating_sub(1) as usize;
@@ -3868,9 +5537,9 @@ impl App {
             );
             let y = inner.y + row as u16;
             let style = if idx == cp.selected {
-                Style::default().bg(SELECT_BG).fg(Color::Rgb(255, 255, 255))
+                Style::default().bg(p.select_bg).fg(p.select_fg)
             } else {
-                Style::default().fg(PLAIN)
+                Style::default().fg(p.plain)
             };
             buf.set_stringn(inner.x, y, text, inner.width as usize, style);
         }
@@ -3881,13 +5550,14 @@ impl App {
                 inner.y + inner.height - 1,
                 footer,
                 inner.width as usize,
-                Style::default().fg(DIM),
+                Style::default().fg(p.dim),
             );
         }
-        fill_default_bg(frame.buffer_mut(), rect, PANEL_BG);
+        fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
     }
 
     fn draw_file_picker(&self, frame: &mut Frame) {
+        let p = self.palette;
         let area = frame.area();
         let Some(fp) = &self.file_picker else {
             return;
@@ -3897,34 +5567,34 @@ impl App {
         let title = format!(" Open from Nextcloud — {} ", fp.path);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(DIM))
+            .border_style(Style::default().fg(p.dim))
             .title(title)
-            .title_style(Style::default().fg(HEADING));
+            .title_style(Style::default().fg(p.heading));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         if fp.loading {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     "Loading…",
-                    Style::default().fg(HEADING),
+                    Style::default().fg(p.heading),
                 ))),
                 inner,
             );
-            fill_default_bg(frame.buffer_mut(), rect, PANEL_BG);
+            fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
             return;
         }
         if let Some(err) = &fp.error {
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::from(Span::styled(err.clone(), Style::default().fg(ERR))),
+                    Line::from(Span::styled(err.clone(), Style::default().fg(p.error))),
                     Line::from(Span::styled(
                         "n new file · r retry · Esc close",
-                        Style::default().fg(DIM),
+                        Style::default().fg(p.dim),
                     )),
                 ]),
                 inner,
             );
-            fill_default_bg(frame.buffer_mut(), rect, PANEL_BG);
+            fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
             return;
         }
         let visible = fp.visible();
@@ -3953,11 +5623,11 @@ impl App {
                 let text = format!("{:<62} {}", name, size);
                 let y = inner.y + row as u16;
                 let style = if idx == fp.selected {
-                    Style::default().bg(SELECT_BG).fg(Color::Rgb(255, 255, 255))
+                    Style::default().bg(p.select_bg).fg(p.select_fg)
                 } else if e.is_dir {
-                    Style::default().fg(HEADING)
+                    Style::default().fg(p.heading)
                 } else {
-                    Style::default().fg(PLAIN)
+                    Style::default().fg(p.plain)
                 };
                 buf.set_stringn(inner.x, y, text, inner.width as usize, style);
             }
@@ -3968,12 +5638,11 @@ impl App {
                     footer_y,
                     format!("/{}", fp.filter),
                     inner.width as usize,
-                    Style::default().fg(ACCENT),
+                    Style::default().fg(p.accent),
                 );
                 let x = inner.x + 1 + fp.filter.chars().count() as u16;
                 if x < inner.x + inner.width {
-                    buf[(x, footer_y)]
-                        .set_style(Style::default().bg(Color::White).fg(Color::Black));
+                    buf[(x, footer_y)].set_style(Style::default().bg(p.cursor_bg).fg(p.cursor_fg));
                 }
             } else {
                 buf.set_stringn(
@@ -3981,7 +5650,7 @@ impl App {
                     footer_y,
                     "Enter open · n new · r refresh · / filter · Backspace up · Esc close",
                     inner.width as usize,
-                    Style::default().fg(DIM),
+                    Style::default().fg(p.dim),
                 );
             }
             let hint_y = inner.y + inner.height.saturating_sub(1);
@@ -3991,14 +5660,15 @@ impl App {
                     hint_y,
                     "Only .odt files are shown",
                     inner.width as usize,
-                    Style::default().fg(DIM),
+                    Style::default().fg(p.dim),
                 );
             }
         }
-        fill_default_bg(frame.buffer_mut(), rect, PANEL_BG);
+        fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
     }
 
     fn draw_input(&self, frame: &mut Frame) {
+        let p = self.palette;
         let area = frame.area();
         let Some(input) = &self.input else {
             return;
@@ -4007,9 +5677,9 @@ impl App {
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(DIM))
+            .border_style(Style::default().fg(p.dim))
             .title(format!(" {} ", input.label))
-            .title_style(Style::default().fg(HEADING));
+            .title_style(Style::default().fg(p.heading));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let line_y = inner.y + 1;
@@ -4036,7 +5706,7 @@ impl App {
                     break;
                 }
                 buf[(x, line_y)].set_char(ch);
-                buf[(x, line_y)].set_style(Style::default().fg(PLAIN));
+                buf[(x, line_y)].set_style(Style::default().fg(p.plain));
                 x += w as u16;
                 consumed += w;
             }
@@ -4046,60 +5716,65 @@ impl App {
                     inner.y + inner.height - 1,
                     "Enter confirm · Esc cancel",
                     inner.width as usize,
-                    Style::default().fg(DIM),
+                    Style::default().fg(p.dim),
                 );
             }
             if cx < inner.x + inner.width {
-                buf[(cx, line_y)].set_style(Style::default().bg(Color::White).fg(Color::Black));
+                buf[(cx, line_y)].set_style(Style::default().bg(p.cursor_bg).fg(p.cursor_fg));
             }
         }
-        fill_default_bg(frame.buffer_mut(), rect, PANEL_BG);
+        fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
     }
 
     fn draw_conflict(&self, frame: &mut Frame) {
+        let p = self.palette;
         let area = frame.area();
         let rect = centered(area, 64.min(area.width), 12.min(area.height));
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(ERR))
+            .border_style(Style::default().fg(p.error))
             .title(" Save conflict ")
-            .title_style(Style::default().fg(ERR));
+            .title_style(Style::default().fg(p.error));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let lines = vec![
             Line::from(Span::styled(
                 "The file changed on Nextcloud since you opened it.",
-                Style::default().fg(PLAIN),
+                Style::default().fg(p.plain),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "[O] Overwrite remote with my version",
-                Style::default().fg(ACCENT),
+                Style::default().fg(p.accent),
             )),
             Line::from(Span::styled(
                 "[R] Reload remote and discard my changes",
-                Style::default().fg(ACCENT),
+                Style::default().fg(p.accent),
             )),
             Line::from(Span::styled(
                 "[S] Save my version as a copy",
-                Style::default().fg(ACCENT),
+                Style::default().fg(p.accent),
             )),
-            Line::from(Span::styled("[Esc] Decide later", Style::default().fg(DIM))),
+            Line::from(Span::styled(
+                "[Esc] Decide later",
+                Style::default().fg(p.dim),
+            )),
         ];
         frame.render_widget(Paragraph::new(lines), inner);
-        fill_default_bg(frame.buffer_mut(), rect, PANEL_BG);
+        fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
     }
 
     fn draw_lock_prompt(&self, frame: &mut Frame) {
+        let p = self.palette;
         let area = frame.area();
         let rect = centered(area, 72.min(area.width), 14.min(area.height));
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(ACCENT))
+            .border_style(Style::default().fg(p.accent))
             .title(" File is locked ")
-            .title_style(Style::default().fg(ACCENT));
+            .title_style(Style::default().fg(p.accent));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let Some(held) = &self.lock_prompt else {
@@ -4115,7 +5790,7 @@ impl App {
         let mut lines = vec![
             Line::from(Span::styled(
                 format!("{name} is open in another scribe instance."),
-                Style::default().fg(PLAIN),
+                Style::default().fg(p.plain),
             )),
             Line::from(""),
             Line::from(Span::styled(
@@ -4123,84 +5798,86 @@ impl App {
                     "Host: {}   User: {}   PID: {}",
                     held.info.host, held.info.user, held.info.pid
                 ),
-                Style::default().fg(PLAIN),
+                Style::default().fg(p.plain),
             )),
             Line::from(Span::styled(
                 format!("Opened: {} ago", fmt_age(held.info.age_secs())),
-                Style::default().fg(DIM),
+                Style::default().fg(p.dim),
             )),
         ];
         if let Some(error) = &held.unreadable {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("The lock file is unreadable: {error}"),
-                Style::default().fg(ERR),
+                Style::default().fg(p.error),
             )));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "[K] Kick the other instance and open here",
-            Style::default().fg(ACCENT),
+            Style::default().fg(p.accent),
         )));
         lines.push(Line::from(Span::styled(
             "[C] Cancel",
-            Style::default().fg(DIM),
+            Style::default().fg(p.dim),
         )));
         frame.render_widget(Paragraph::new(lines), inner);
-        fill_default_bg(frame.buffer_mut(), rect, PANEL_BG);
+        fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
     }
 
     fn draw_lock_waiting(&self, frame: &mut Frame) {
+        let p = self.palette;
         let area = frame.area();
         let rect = centered(area, 68.min(area.width), 8.min(area.height));
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(HEADING))
+            .border_style(Style::default().fg(p.heading))
             .title(" Waiting for lock ")
-            .title_style(Style::default().fg(HEADING));
+            .title_style(Style::default().fg(p.heading));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let lines = vec![
             Line::from(Span::styled(
                 "Waiting for the other instance to release the lock…",
-                Style::default().fg(PLAIN),
+                Style::default().fg(p.plain),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "The file opens here as soon as the old editor exits.",
-                Style::default().fg(DIM),
+                Style::default().fg(p.dim),
             )),
         ];
         frame.render_widget(Paragraph::new(lines), inner);
-        fill_default_bg(frame.buffer_mut(), rect, PANEL_BG);
+        fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
     }
 
     fn draw_lock_force(&self, frame: &mut Frame) {
+        let p = self.palette;
         let area = frame.area();
         let rect = centered(area, 68.min(area.width), 12.min(area.height));
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(ERR))
+            .border_style(Style::default().fg(p.error))
             .title(" Other instance did not respond ")
-            .title_style(Style::default().fg(ERR));
+            .title_style(Style::default().fg(p.error));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let lines = vec![
             Line::from(Span::styled(
                 "It may be offline, crashed, or no longer running.",
-                Style::default().fg(PLAIN),
+                Style::default().fg(p.plain),
             )),
             Line::from(""),
             Line::from(Span::styled(
                 "[F] Force open anyway (it may not have saved)",
-                Style::default().fg(ACCENT),
+                Style::default().fg(p.accent),
             )),
-            Line::from(Span::styled("[C] Cancel", Style::default().fg(DIM))),
+            Line::from(Span::styled("[C] Cancel", Style::default().fg(p.dim))),
         ];
         frame.render_widget(Paragraph::new(lines), inner);
-        fill_default_bg(frame.buffer_mut(), rect, PANEL_BG);
+        fill_default_bg(frame.buffer_mut(), rect, p.panel_bg);
     }
 }
 
@@ -4298,6 +5975,51 @@ fn alt_only(key: &KeyEvent) -> bool {
 
 fn is_text_key(key: &KeyEvent) -> bool {
     !key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT)
+}
+
+fn notes_local_path(path: &Path) -> PathBuf {
+    if path.to_string_lossy().ends_with(".notes.odt") {
+        return path.to_path_buf();
+    }
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".notes.odt");
+    PathBuf::from(value)
+}
+
+fn notes_remote_path(path: &str) -> String {
+    if path.ends_with(".notes.odt") {
+        path.to_string()
+    } else {
+        format!("{path}.notes.odt")
+    }
+}
+
+fn notes_title(path: &str) -> String {
+    path.rsplit('/')
+        .next()
+        .unwrap_or("Notes")
+        .trim_end_matches(".odt")
+        .to_string()
+}
+
+fn notes_document_from(book: &Book) -> Result<OdtDocument> {
+    let title = book.title.trim();
+    let title = if title.is_empty() {
+        "Notes".to_string()
+    } else {
+        format!("{title} — Notes")
+    };
+    let mut doc = OdtDocument::new(title)?;
+    doc.book.chapters = book
+        .chapters
+        .iter()
+        .map(|chapter| Chapter::new(chapter.number, chapter.title.clone()))
+        .collect();
+    if doc.book.chapters.is_empty() {
+        doc.book.chapters.push(Chapter::new(1, ""));
+    }
+    doc.book.renumber();
+    Ok(doc)
 }
 
 fn parent_path(path: &str) -> String {
@@ -4423,6 +6145,22 @@ fn text_width(value: &str) -> usize {
         .chars()
         .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(1))
         .sum()
+}
+
+fn search_byte_at(value: &str, char_idx: usize) -> usize {
+    value
+        .char_indices()
+        .nth(char_idx)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len())
+}
+
+/// Query columns available in the status bar after " Find: " and the match
+/// counter. The query never scrolls horizontally.
+fn search_query_capacity(width: u16) -> usize {
+    (width as usize)
+        .saturating_sub(text_width(" Find: ") + 10)
+        .max(1)
 }
 
 fn ai_issue_line(issue: &ai::Issue, index: usize) -> String {
@@ -4577,6 +6315,74 @@ mod tests {
             assert!(!menu.entries.is_empty(), "{} is empty", menu.label);
             assert!(menu_dropdown_width(menu) >= 14);
         }
+    }
+
+    #[test]
+    fn notes_paths_append_the_sidecar_suffix() {
+        assert_eq!(
+            notes_local_path(Path::new("/tmp/book.odt")),
+            PathBuf::from("/tmp/book.odt.notes.odt")
+        );
+        assert_eq!(
+            notes_remote_path("/Docs/book.odt"),
+            "/Docs/book.odt.notes.odt"
+        );
+        assert_eq!(notes_title("/Docs/book.odt.notes.odt"), "book.odt.notes");
+        assert_eq!(
+            notes_remote_path("/Docs/book.odt.notes.odt"),
+            "/Docs/book.odt.notes.odt"
+        );
+    }
+
+    #[test]
+    fn notes_document_mirrors_chapters() {
+        let mut book = Book::new("My Book");
+        book.chapters[0].title = "One".to_string();
+        book.chapters.push(Chapter::new(2, "Two"));
+        let notes = notes_document_from(&book).unwrap();
+        assert_eq!(notes.book.title, "My Book — Notes");
+        assert_eq!(notes.book.chapters.len(), 2);
+        assert_eq!(notes.book.chapters[0].title, "One");
+        assert_eq!(notes.book.chapters[1].title, "Two");
+        assert!(
+            notes
+                .book
+                .chapters
+                .iter()
+                .all(|chapter| chapter.paragraphs.len() == 1
+                    && chapter.paragraphs[0].chars.is_empty())
+        );
+    }
+
+    #[test]
+    fn search_query_space_is_derived_from_the_status_width() {
+        assert_eq!(search_query_capacity(100), 83);
+        assert_eq!(search_query_capacity(10), 1);
+        assert_eq!(search_byte_at("abc", 0), 0);
+        assert_eq!(search_byte_at("abc", 2), 2);
+        assert_eq!(search_byte_at("abc", 9), 3);
+    }
+
+    #[test]
+    fn config_panel_never_shows_the_raw_key() {
+        let cfg = ai::AiConfig {
+            api_key: "sk-verysecretvalue123".to_string(),
+            ..ai::AiConfig::default()
+        };
+        let mut panel = ConfigPanel::new(cfg, ThemeName::Monokai);
+        let shown = panel.display_key();
+        assert!(!shown.contains("verysecretvalue"));
+        assert!(shown.starts_with("sk-ve"));
+        assert!(shown.ends_with("e123"));
+
+        panel.selected = CONFIG_FIELDS
+            .iter()
+            .position(|field| *field == ConfigField::ApiKey)
+            .unwrap();
+        panel.start_edit();
+        panel.editing.as_mut().unwrap().insert('x');
+        panel.editing.as_mut().unwrap().insert('y');
+        assert_eq!(panel.display_key(), "••");
     }
 
     #[test]

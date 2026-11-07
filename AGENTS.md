@@ -56,19 +56,23 @@ scribe roundtrip in.odt out.odt
 - The ODT zip must keep `mimetype` as the first, uncompressed entry.
 - New documents use `assets/template.odt`: Letter, 1-inch margins, Title 28pt Arial, H2 16pt, Normal 12pt Book Antiqua, justified, 1.27cm first-line indent.
 - First chapter uses `MydocsFirstChapter` with `fo:break-before="auto"`. Chapters 2+ use `MydocsChapter` with `fo:break-before="page"`.
-- Automatic styles written by us are named `MydocsTitle`, `MydocsFirstChapter`, `MydocsChapter`, `MydocsBody`, `MydocsBold`, `MydocsItalic`, `MydocsBoldItalic`. On read, `strip_mydocs_styles` removes old copies before re-adding them.
+- Automatic styles written by us are named `MydocsTitle`, `MydocsFirstChapter`, `MydocsChapter`, `MydocsSubheading`, `MydocsBody`, `MydocsBodyLeft/Center/Right`, `MydocsSubheadingLeft/Center/Right/Justify`, `MydocsBold`, `MydocsItalic`, `MydocsUnderline`, `MydocsStrike`. On read, `strip_mydocs_styles` removes old copies before re-adding them.
+- Character decorations are composed by nesting single-property spans, not by generating one style name per bold/italic/underline/strike combination.
 - `detect_refs` must resolve `Mydocs*` styles back to their base parent styles. Never allow a `Mydocs*` style to become its own parent; `valid_ref` guards against this.
-- Paragraph style detection is heuristic: `text:h` level, outline level, style names, then font-size fallback (>=20pt H1, >=14pt H2). The sample ODT has no outline levels, so font-size fallback matters.
+- Paragraph style detection is heuristic: `text:h` level, outline level, style names, then font-size fallback (>=20pt H1, >=14pt H2). Outline levels 1-6 and `Heading 1/2/3` names are recognized; levels 3+ become in-chapter H3 subheadings. The sample ODT has no outline levels, so font-size fallback matters.
+- `<text:line-break/>` is preserved as a `'\n'` character inside a paragraph; it is not a paragraph split.
 - Save atomically. Local files use temp+persist. Cache/backup writes are atomic too.
 
 ### Editor / TUI
 
-- Mark/selection only. `Ctrl+Space` sets the mark at the cursor; moving extends the live selection; `Ctrl+Space` again finalizes it. `Esc` clears it. After finalizing, a cursor move clears the selection and moves normally. `Delete`/`Backspace` removes the selection, typing replaces it, and bold/italic apply to it. Selection is limited to the current chapter (switching chapters clears it). No cut/copy/search. Paste works via bracketed paste, and pasting replaces an active selection.
+- Mark/selection only. `Ctrl+Space` sets the mark at the cursor; moving extends the live selection; `Ctrl+Space` again finalizes it and opens the Selection popup (Bold/Italic/Underline/Strikethrough/Delete/None). `Esc` in the popup keeps the selection and closes it. After finalizing, a cursor move clears the selection and moves normally. `Delete`/`Backspace` removes the selection, typing replaces it, and inline style actions apply to it. Selection is limited to the current chapter (switching chapters clears it). No cut/copy/search. Paste works via bracketed paste, and pasting replaces an active selection.
 - Text width: `min(120, terminal_width - 4)`. Page height: `terminal_height - 2` (one row menu bar + one row status).
 - The top menu bar is always visible. `F9` focuses it and opens the first menu; `←`/`→` switch menus, `↑`/`↓` move between enabled items, `Enter` runs, and `Esc`/`F9` closes. Menu actions must call the same `action_*` methods as the shortcuts; never duplicate command logic in the menu path.
-- Page background is `PAGE_BG` with dim `│` rules on both sides. Do not reduce the document text width for the rules; they sit outside the text area.
-- Cursor is a **drawn ANSI white block** with black foreground. The native terminal cursor is hidden in `run_tui`. Do **not** call `frame.set_cursor_position` for the editor/prompt cursor again: that causes double inversion on block-cursor terminals and makes the cursor look like only a character color change.
-- A marked range paints `SELECTION_BG` behind its characters and shows `SEL n` in the status bar. The cursor block still draws over the endpoint.
+- Notes sidecar: `F7` (or `Tools → Notes`) toggles a second in-memory document session. The path is `<document>.notes.odt` (append the suffix; do not replace the original extension). A missing notes file is created automatically and mirrors the book's chapter titles with empty paragraphs. Park both `Editor` instances in `DocMemory` so cursor/undo state survives switching; flush the outgoing document before swapping. Notes must not update `last_file` in `credentials.toml` and do not acquire their own lock.
+- Find: `F3` (or `Edit → Find…`) opens a one-line status-bar prompt. Typing edits the query; `Enter` searches from the cursor, `F3` finds the next match, and `Esc` closes the prompt while leaving the cursor at the last match. Search is always case-insensitive, runs over the whole active document, wraps at the end, never crosses paragraph boundaries, and treats soft line breaks as spaces. The query is capped to the available status-bar width and never scrolls. There is no replace. Reset search state whenever the active document changes.
+- Page background is the theme's `page_bg` with dim `│` rules on both sides. Do not reduce the document text width for the rules; they sit outside the text area.
+- Cursor is a **drawn block** using the theme's `cursor_bg`/`cursor_fg`. The native terminal cursor is hidden in `run_tui`. Do **not** call `frame.set_cursor_position` for the editor/prompt cursor again: that causes double inversion on block-cursor terminals and makes the cursor look like only a character color change.
+- A marked range paints the theme's `selection_bg` behind its characters and shows `SEL n` in the status bar. The cursor block still draws over the endpoint.
 - Cursor must always stay in the viewport after moves, edits, page flips, chapter jumps, and resize.
 - `Ctrl+L` requests a full terminal clear + redraw. External processes writing to the TTY can corrupt ratatui’s diff and persist garbage; `Ctrl+L` is the recovery path.
 - Browser launches during login must detach stdio to `/dev/null` and not wait. Firefox/Glean logs inheriting the TTY will corrupt the TUI.
@@ -84,7 +88,7 @@ scribe roundtrip in.odt out.odt
   - Chapter/book title prompts use smart quotes; file-name prompts do not.
 - Bold/italic toggles the word under the cursor, or sets pending style for the next text. `B*` / `I*` in the status bar means pending.
 - Status bar totals include the book title, chapter titles, and body. Page counts are **terminal pages**, not printed ODT pages.
-- Keep the hardcoded dark palette; do not add a theme system unless asked.
+- Colors come from `src/theme.rs` palettes (Monokai, Nord, One Dark, Paper). Rendering code must use `self.palette` roles rather than hardcoded colors. New color roles must be added to every theme.
 
 ### AI writing check
 
@@ -193,10 +197,10 @@ Check that the menu bar occupies the first row, the dropdown overlaps the editor
 
 - No DOCX support.
 - No manual page break inside a chapter.
-- No search/replace, cut/copy, multi-cursor, or theme system. Selection exists only as a mark range; there is no clipboard integration.
+- No search/replace, cut/copy, or multi-cursor. Selection exists only as a mark range; there is no clipboard integration.
 - No automatic restore command for backups.
 - Support is strict: ODT structure/unsupported elements are refused rather than guessed.
-- Formatting is normalized to H1/H2/body plus bold/italic. Other inline formatting is dropped; unsupported blocks are refused.
+- Formatting is normalized to H1/H2/H3/body plus bold/italic/underline/strikethrough, paragraph alignment, and soft line breaks. Other inline formatting is dropped; unsupported blocks are refused.
 
 ## Safe change workflow
 

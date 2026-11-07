@@ -1,15 +1,86 @@
 use unicode_width::UnicodeWidthChar;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StyleAttr {
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+}
+
+impl TextStyle {
+    pub fn get(self, attr: StyleAttr) -> bool {
+        match attr {
+            StyleAttr::Bold => self.bold,
+            StyleAttr::Italic => self.italic,
+            StyleAttr::Underline => self.underline,
+            StyleAttr::Strike => self.strike,
+        }
+    }
+
+    pub fn toggled(mut self, attr: StyleAttr) -> Self {
+        let value = !self.get(attr);
+        match attr {
+            StyleAttr::Bold => self.bold = value,
+            StyleAttr::Italic => self.italic = value,
+            StyleAttr::Underline => self.underline = value,
+            StyleAttr::Strike => self.strike = value,
+        }
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ParaKind {
+    #[default]
+    Body,
+    Subheading,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+    #[default]
+    Justify,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StyledChar {
     pub ch: char,
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
+    pub strike: bool,
 }
 
 impl StyledChar {
-    pub fn new(ch: char, bold: bool, italic: bool) -> Self {
-        Self { ch, bold, italic }
+    pub fn with_style(ch: char, style: TextStyle) -> Self {
+        Self {
+            ch,
+            bold: style.bold,
+            italic: style.italic,
+            underline: style.underline,
+            strike: style.strike,
+        }
+    }
+
+    pub fn style(&self) -> TextStyle {
+        TextStyle {
+            bold: self.bold,
+            italic: self.italic,
+            underline: self.underline,
+            strike: self.strike,
+        }
     }
 
     pub fn plain(ch: char) -> Self {
@@ -17,6 +88,8 @@ impl StyledChar {
             ch,
             bold: false,
             italic: false,
+            underline: false,
+            strike: false,
         }
     }
 
@@ -28,12 +101,16 @@ impl StyledChar {
 #[derive(Clone, Debug, Default)]
 pub struct Para {
     pub chars: Vec<StyledChar>,
+    pub kind: ParaKind,
+    pub align: Align,
 }
 
 impl Para {
     pub fn from_text(text: &str) -> Self {
         Self {
             chars: text.chars().map(StyledChar::plain).collect(),
+            kind: ParaKind::Body,
+            align: Align::Justify,
         }
     }
 
@@ -49,18 +126,9 @@ impl Para {
         self.chars.is_empty()
     }
 
-    pub fn insert_str(&mut self, at: usize, text: &str, bold: bool, italic: bool) {
+    pub fn insert_char(&mut self, at: usize, ch: char, style: TextStyle) {
         let at = at.min(self.chars.len());
-        let added: Vec<StyledChar> = text
-            .chars()
-            .map(|ch| StyledChar::new(ch, bold, italic))
-            .collect();
-        self.chars.splice(at..at, added);
-    }
-
-    pub fn insert_char(&mut self, at: usize, ch: char, bold: bool, italic: bool) {
-        let at = at.min(self.chars.len());
-        self.chars.insert(at, StyledChar::new(ch, bold, italic));
+        self.chars.insert(at, StyledChar::with_style(ch, style));
     }
 
     pub fn remove_range(&mut self, start: usize, end: usize) {
@@ -74,7 +142,21 @@ impl Para {
     pub fn split_off(&mut self, at: usize) -> Para {
         let at = at.min(self.chars.len());
         let rest = self.chars.split_off(at);
-        Para { chars: rest }
+        let kind = if self.kind == ParaKind::Subheading {
+            ParaKind::Body
+        } else {
+            self.kind
+        };
+        let align = if kind == ParaKind::Subheading {
+            Align::Left
+        } else {
+            self.align
+        };
+        Para {
+            chars: rest,
+            kind,
+            align,
+        }
     }
 
     pub fn append(&mut self, other: &mut Para) {
@@ -110,40 +192,37 @@ impl Para {
         Some((start, end))
     }
 
-    pub fn style_at(&self, offset: usize) -> (bool, bool) {
+    pub fn style_at(&self, offset: usize) -> TextStyle {
         if self.chars.is_empty() {
-            return (false, false);
+            return TextStyle::default();
         }
         if offset < self.chars.len() {
-            let c = self.chars[offset];
-            return (c.bold, c.italic);
+            return self.chars[offset].style();
         }
-        let c = self.chars[self.chars.len() - 1];
-        (c.bold, c.italic)
+        self.chars[self.chars.len() - 1].style()
     }
 
-    pub fn set_style_range(&mut self, start: usize, end: usize, bold: bool, italic: bool) {
+    pub fn set_style_range(&mut self, start: usize, end: usize, style: TextStyle) {
         let start = start.min(self.chars.len());
         let end = end.min(self.chars.len()).max(start);
         for c in &mut self.chars[start..end] {
-            c.bold = bold;
-            c.italic = italic;
+            c.bold = style.bold;
+            c.italic = style.italic;
+            c.underline = style.underline;
+            c.strike = style.strike;
         }
     }
 
-    pub fn set_bold_range(&mut self, start: usize, end: usize, bold: bool) {
+    pub fn set_attr_range(&mut self, start: usize, end: usize, attr: StyleAttr, enabled: bool) {
         let start = start.min(self.chars.len());
         let end = end.min(self.chars.len()).max(start);
         for c in &mut self.chars[start..end] {
-            c.bold = bold;
-        }
-    }
-
-    pub fn set_italic_range(&mut self, start: usize, end: usize, italic: bool) {
-        let start = start.min(self.chars.len());
-        let end = end.min(self.chars.len()).max(start);
-        for c in &mut self.chars[start..end] {
-            c.italic = italic;
+            match attr {
+                StyleAttr::Bold => c.bold = enabled,
+                StyleAttr::Italic => c.italic = enabled,
+                StyleAttr::Underline => c.underline = enabled,
+                StyleAttr::Strike => c.strike = enabled,
+            }
         }
     }
 }
@@ -177,7 +256,12 @@ impl Chapter {
     }
 
     pub fn char_count(&self) -> usize {
-        self.title.chars().count() + self.paragraphs.iter().map(|p| p.chars.len()).sum::<usize>()
+        self.title.chars().count()
+            + self
+                .paragraphs
+                .iter()
+                .map(|p| p.chars.iter().filter(|c| c.ch != '\n').count())
+                .sum::<usize>()
     }
 
     pub fn ensure_paragraph(&mut self) {
@@ -311,7 +395,14 @@ mod tests {
     #[test]
     fn style_range() {
         let mut p = Para::from_text("abcd");
-        p.set_style_range(1, 3, true, false);
+        p.set_style_range(
+            1,
+            3,
+            TextStyle {
+                bold: true,
+                ..TextStyle::default()
+            },
+        );
         assert_eq!(p.chars[0].bold, false);
         assert_eq!(p.chars[1].bold, true);
         assert_eq!(p.chars[2].bold, true);

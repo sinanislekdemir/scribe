@@ -8,9 +8,14 @@ Built for a narrow document shape:
 
 - one H1 = book title
 - H2 = chapters
+- H3 = in-chapter subheadings
 - normal paragraphs with an automatic first-line indent
+- left / center / right / justified paragraphs
+- soft line breaks inside a paragraph (poetry, addresses, epigraphs)
 - each chapter starts on a new page
-- bold / italic with real ODT character styles
+- bold / italic / underline / strikethrough with real ODT character styles
+- a notes sidecar document (`.notes.odt`) toggled with `F7`
+- built-in case-insensitive find (`F3`) with no replace
 
 The TUI is intentionally small: one chapter at a time, a centered 120-column text area, terminal-sized pages, total word/char/page counts, and autosave.
 
@@ -123,7 +128,10 @@ Only `.odt` files are accepted. `.docx` is not supported at any level.
 | Key | Action |
 |---|---|
 | `F9` | Open/close the top menu (arrows navigate, Enter runs) |
+| `F7` | Switch to/from the notes sidecar (creates it on first use) |
 | `F8` | AI writing check for the current chapter (opens the suggestions panel) |
+| `F3` | Find in the active document; press again for the next match |
+| `Ctrl+,` / `Alt+,` | Open the configuration panel (AI settings and theme) |
 | `Ctrl+O` | Open an ODT from Nextcloud |
 | `Ctrl+S` | Save now |
 | `Ctrl+N` | Create a chapter after the current one |
@@ -135,6 +143,9 @@ Only `.odt` files are accepted. `.docx` is not supported at any level.
 | `Alt+Up` / `Alt+Down` | Previous / next chapter |
 | `Ctrl+B` / `Alt+B` | Toggle bold on the current word |
 | `Alt+I` | Toggle italic on the current word |
+| `Alt+U` | Toggle underline on the current word or selection |
+| `Alt+S` | Toggle strikethrough on the current word or selection |
+| `Shift+Enter` / `Alt+Enter` | Soft line break inside the paragraph |
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo |
 | `Backspace` / `Delete` | Delete character / merge paragraphs; deletes the selection when active |
 | `Ctrl+W` / `Ctrl+Delete` | Delete previous / next word |
@@ -155,9 +166,11 @@ The top menu bar is always visible. Press `F9` to focus it, use `←`/`→` to s
 
 `File → Download a copy` is available for Nextcloud files and has no keyboard shortcut. It writes the current document, including unsaved edits, to `existing/` in the directory where `scribe` was started, creating the directory if needed. The cloud file's name is kept; if a file with that name is already there, the copy becomes `<name>_<unix-seconds>.odt`.
 
-Marking works like this: press `Ctrl+Space` at the start, move with any cursor keys (`PgUp`/`PgDn`, `Ctrl+Home`/`Ctrl+End`, etc.), then press `Ctrl+Space` again to finish the mark. The selected range is highlighted and the status bar shows `SEL n`. `Delete` or `Backspace` removes it; typing replaces it; `Ctrl+B` / `Alt+I` applies bold/italic to it. `Esc` clears the mark. A mark is limited to the current chapter.
+Marking works like this: press `Ctrl+Space` at the start, move with any cursor keys (`PgUp`/`PgDn`, `Ctrl+Home`/`Ctrl+End`, etc.), then press `Ctrl+Space` again to finish the mark. The selected range is highlighted and the status bar shows `SEL n`. Finishing a mark opens a **Selection** popup with Bold, Italic, Underline, Strikethrough, Delete, and None; use `↑`/`↓` and `Enter`, the shown letter shortcuts, or `Esc`/`None` to keep the selection. `Delete` or `Backspace` removes it; typing replaces it. `Esc` clears the mark. A mark is limited to the current chapter.
 
-Bold/italic applies to the marked range when there is one, otherwise to the word under the cursor, or to the next typed text when the cursor is between words. A `B*` / `I*` indicator means the style is pending for the next typed text. `Alt+I` is used for italic because most terminals send `Ctrl+I` as Tab.
+`Edit → Selection actions…` opens the same popup for an existing selection. Inline style menu items are enabled while a range is selected. Bold/italic/underline/strikethrough apply to the marked range when there is one, otherwise to the word under the cursor, or to the next typed text when the cursor is between words. A `B*` / `I*` / `U*` / `S*` indicator means the style is pending for the next typed text. `Alt+I` is used for italic because most terminals send `Ctrl+I` as Tab.
+
+Paragraph-level formatting lives in the `Edit` menu: **Subheading (H3)** toggles the current paragraph (or every paragraph touched by the selection), and **Align left / center / right / justify** sets paragraph alignment. **Line break** inserts a soft break without starting a new paragraph.
 
 Typing a double or single quote produces a curly quote automatically. The editor uses the preceding character to choose opening vs closing. This also handles apostrophes: `Anette'nin` becomes `Anette’nin`, while `'dialogue'` becomes `‘dialogue’`. Pasted text and existing straight quotes are left unchanged.
 
@@ -181,19 +194,70 @@ Status line:
 
 Page counts are **terminal pages** at the current width/height, not printed ODT pages.
 
+## Themes
+
+The interface ships with four themes, selectable in `Tools → Configuration…`
+(also `Ctrl+,` or `Alt+,`) under **Appearance**:
+
+- **Monokai** — dark, high-contrast classic (default)
+- **Nord** — cool blue-gray dark
+- **One Dark** — Atom-style dark
+- **Paper** — a warm, low-glare light theme that avoids pure white and pure black
+
+The choice is saved to `~/.config/scribe/settings.toml` and restored on the next
+start. `←`/`→` previews a theme immediately; `s` saves it, `Esc` reverts.
+
+## Search
+
+`F3` (or `Edit → Find…`) opens a search prompt in the status bar.
+
+- Type the phrase; `Enter` finds the first match at or after the cursor.
+- `F3` finds the next match. Search is case-insensitive and wraps from the end
+  back to the beginning of the active document.
+- While search is open, typing edits the search phrase. `←`/`→`, `Home`/`End`,
+  `Backspace`, `Delete`, and `Ctrl+W` edit within it.
+- The current match is highlighted. A counter (`2/17`) appears on the right.
+- `Esc` closes the prompt and leaves the cursor at the last match (or back at
+  the starting point if nothing matched).
+- There is no replace. The search phrase is capped to the available status-bar
+  width and never scrolls.
+
+## Notes
+
+`F7` (or `Tools → Notes`) switches between the book and its notes sidecar.
+The sidecar is a normal ODT document next to the original file, named:
+
+```
+book.odt  →  book.odt.notes.odt
+```
+
+It is created automatically on first use. New notes documents mirror the
+book's chapters (same titles, empty paragraphs), so each chapter can hold its
+own notes. Both documents keep their cursor, undo history, and unsaved state in
+memory while you switch; the inactive one is flushed to disk/Nextcloud.
+
+The status bar shows `NOTES` while the sidecar is open. Notes use the same
+formatting, AI check, autosave, and export features as the book.
+
 ## AI writing check
 
 `F8` (or `Tools → Check writing (AI)…`) sends the **current chapter** to an
 OpenAI-compatible endpoint and opens a suggestions drawer above the status bar.
 Nothing is changed automatically: each suggestion must be applied explicitly.
 
-Setup:
+Setup can be done in the TUI (`Ctrl+,` / `Tools → Configuration…`) or from the
+command line:
 
 ```bash
 scribe ai-config          # base URL, model, API key, language
 scribe ai-config --show   # show the config, key masked
 scribe ai-config --test   # tiny request to verify the endpoint
 ```
+
+The configuration panel never displays the raw API key: it shows a masked
+value and only bullets while a replacement is typed. Press `Delete` on the key
+row to clear it, or type a new value and press `Enter`; an empty replacement
+keeps the current key. Press `t` in the panel to verify the endpoint.
 
 The config lives in `~/.config/scribe/ai.toml` (mode 0600), separate from the
 Nextcloud credentials:
@@ -240,7 +304,7 @@ not to rewrite or translate. Turkish and English are supported (`language =
 "auto"` detects the text; set `tr` or `en` to pin it).
 
 Applying a suggestion replaces only the exact quoted span, keeps the surrounding
-text and bold/italic, and is a normal undo step (`Ctrl+Z`). Suggestions whose
+text and its character styles, and is a normal undo step (`Ctrl+Z`). Suggestions whose
 text no longer matches are dropped instead of guessed. If the chapter changes
 while a request is running, the result is discarded and you can press `R` to run
 again.
@@ -300,7 +364,7 @@ the fallback for changes made by those clients.
 - Existing `.odt` files are edited in place: the package, `styles.xml`, page layout, fonts, and original automatic styles are preserved.
 - `content.xml` is rewritten from the simple book model.
 - Chapter headings after the first get `fo:break-before="page"`; chapter 1 shares page 1 with the title.
-- Real bold/italic character styles are written to the ODT. The TUI also colors them: bold orange, italic purple, both pink.
+- Real bold/italic/underline/strikethrough character styles are written to the ODT. The TUI also colors bold/italic and renders underline/strikethrough with terminal modifiers.
 - Documents containing tables, images, frames, lists, sections, footnotes, comments, tracked changes, hyperlinks, fields, or drawings are refused with a clear list. Edit those in OnlyOffice.
 - ODT package writes are atomic; `mimetype` remains the first, uncompressed zip entry.
 
@@ -325,12 +389,14 @@ Local-file saves back up on every successful local write. Remote saves back up a
 ```
 ~/.config/scribe/credentials.toml
 ~/.config/scribe/ai.toml
+~/.config/scribe/settings.toml
 ~/.cache/scribe/files/<hash>.odt
 ~/.cache/scribe/files/<hash>.json
 ```
 
 `credentials.toml` contains the server URL, login name, generated app password, last folder, and last file.
 `ai.toml` (mode 0600) contains the OpenAI-compatible endpoint, model, API key, and language for the writing check; see [AI writing check](#ai-writing-check).
+`settings.toml` (mode 0600) stores the selected UI theme; see [Themes](#themes).
 
 On the first run after the rename, `scribe` copies the old
 `~/.config/mydocs-tui/credentials.toml` if the new file is missing, and moves

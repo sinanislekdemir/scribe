@@ -6,7 +6,9 @@ use roxmltree::{Document, Node};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use crate::model::{Book, Chapter, Para, StyledChar, parse_chapter_number};
+use crate::model::{
+    Align, Book, Chapter, Para, ParaKind, StyledChar, TextStyle, parse_chapter_number,
+};
 
 pub const TEMPLATE_ODT: &[u8] = include_bytes!("../../assets/template.odt");
 
@@ -93,6 +95,7 @@ impl OdtPackage {
 pub struct StyleRefs {
     pub title: String,
     pub chapter: String,
+    pub subheading: String,
     pub body: String,
 }
 
@@ -101,6 +104,7 @@ impl StyleRefs {
         Self {
             title: "BookTitle".into(),
             chapter: "ChapterHeading".into(),
+            subheading: "ChapterHeading".into(),
             body: "Body".into(),
         }
     }
@@ -185,8 +189,11 @@ struct StyleInfo {
     parent: Option<String>,
     outline: Option<u32>,
     font_size: Option<f32>,
-    bold: bool,
-    italic: bool,
+    bold: Option<bool>,
+    italic: Option<bool>,
+    underline: Option<bool>,
+    strike: Option<bool>,
+    align: Option<Align>,
     break_before: bool,
 }
 
@@ -231,6 +238,15 @@ impl StyleMap {
                         if attr(child, NS_FO, "break-before") == Some("page") {
                             info.break_before = true;
                         }
+                        if let Some(value) = attr(child, NS_FO, "text-align") {
+                            info.align = match value {
+                                "left" | "start" => Some(Align::Left),
+                                "center" => Some(Align::Center),
+                                "right" | "end" => Some(Align::Right),
+                                "justify" => Some(Align::Justify),
+                                _ => None,
+                            };
+                        }
                         for a in child.attributes() {
                             if a.name().ends_with("outline-level") {
                                 if let Ok(level) = a.value().parse::<u32>() {
@@ -244,11 +260,27 @@ impl StyleMap {
                             info.font_size = parse_pt(size);
                         }
                         if let Some(weight) = attr(child, NS_FO, "font-weight") {
-                            info.bold =
-                                matches!(weight, "bold" | "bolder" | "600" | "700" | "800" | "900");
+                            info.bold = Some(matches!(
+                                weight,
+                                "bold" | "bolder" | "600" | "700" | "800" | "900"
+                            ));
                         }
                         if let Some(style) = attr(child, NS_FO, "font-style") {
-                            info.italic = matches!(style, "italic" | "oblique");
+                            info.italic = Some(matches!(style, "italic" | "oblique"));
+                        }
+                        if let Some(value) = attr(child, NS_STYLE, "text-underline-style") {
+                            info.underline = Some(value != "none");
+                        }
+                        if let Some(value) = attr(child, NS_STYLE, "text-line-through-style") {
+                            info.strike = Some(value != "none");
+                        }
+                        if let Some(value) = attr(child, NS_FO, "text-decoration") {
+                            if value.contains("underline") {
+                                info.underline = Some(true);
+                            }
+                            if value.contains("line-through") {
+                                info.strike = Some(true);
+                            }
                         }
                     }
                     _ => {}
@@ -288,8 +320,21 @@ impl StyleMap {
             if info.font_size.is_some() {
                 out.font_size = info.font_size;
             }
-            out.bold |= info.bold;
-            out.italic |= info.italic;
+            if info.bold.is_some() {
+                out.bold = info.bold;
+            }
+            if info.italic.is_some() {
+                out.italic = info.italic;
+            }
+            if info.underline.is_some() {
+                out.underline = info.underline;
+            }
+            if info.strike.is_some() {
+                out.strike = info.strike;
+            }
+            if info.align.is_some() {
+                out.align = info.align;
+            }
             out.break_before |= info.break_before;
         }
         out
@@ -312,9 +357,12 @@ impl StyleMap {
             if n.contains("heading 2") || n.contains("heading2") {
                 return Some(2);
             }
+            if n.contains("heading 3") || n.contains("heading3") {
+                return Some(3);
+            }
         }
         if let Some(level) = info.outline {
-            if level == 1 || level == 2 {
+            if (1..=6).contains(&level) {
                 return Some(level);
             }
         }
@@ -329,9 +377,14 @@ impl StyleMap {
         None
     }
 
-    fn text_style(&self, name: &str) -> (bool, bool) {
+    fn text_style(&self, name: &str) -> TextStyle {
         let info = self.resolved(name);
-        (info.bold, info.italic)
+        TextStyle {
+            bold: info.bold.unwrap_or(false),
+            italic: info.italic.unwrap_or(false),
+            underline: info.underline.unwrap_or(false),
+            strike: info.strike.unwrap_or(false),
+        }
     }
 }
 
@@ -385,15 +438,14 @@ fn collect_text(node: Node<'_, '_>, bold: bool, italic: bool, out: &mut String) 
 fn extract_inline(
     node: Node<'_, '_>,
     styles: &StyleMap,
-    bold: bool,
-    italic: bool,
+    style: TextStyle,
     out: &mut Vec<StyledChar>,
 ) {
     for child in node.children() {
         if child.is_text() {
             if let Some(t) = child.text() {
                 for ch in t.chars() {
-                    out.push(StyledChar::new(ch, bold, italic));
+                    out.push(StyledChar::with_style(ch, style));
                 }
             }
         } else if child.is_element() {
@@ -403,32 +455,34 @@ fn extract_inline(
                         .and_then(|s| s.parse::<usize>().ok())
                         .unwrap_or(1);
                     for _ in 0..n {
-                        out.push(StyledChar::new(' ', bold, italic));
+                        out.push(StyledChar::with_style(' ', style));
                     }
                 }
                 (Some(NS_TEXT), "tab") => {
                     for _ in 0..4 {
-                        out.push(StyledChar::new(' ', bold, italic));
+                        out.push(StyledChar::with_style(' ', style));
                     }
                 }
                 (Some(NS_TEXT), "line-break") => {
-                    out.push(StyledChar::new(' ', bold, italic));
+                    out.push(StyledChar::with_style('\n', style));
                 }
                 (Some(NS_TEXT), "span") => {
-                    let (mut b, mut i) = (bold, italic);
+                    let mut next = style;
                     if let Some(name) = attr(child, NS_TEXT, "style-name") {
-                        let (sb, si) = styles.text_style(name);
-                        b |= sb;
-                        i |= si;
+                        let span = styles.text_style(name);
+                        next.bold |= span.bold;
+                        next.italic |= span.italic;
+                        next.underline |= span.underline;
+                        next.strike |= span.strike;
                     }
-                    extract_inline(child, styles, b, i, out);
+                    extract_inline(child, styles, next, out);
                 }
                 (Some(NS_TEXT), "bookmark-start")
                 | (Some(NS_TEXT), "bookmark-end")
                 | (Some(NS_TEXT), "bookmark")
                 | (Some(NS_TEXT), "soft-page-break") => {}
                 _ => {
-                    extract_inline(child, styles, bold, italic, out);
+                    extract_inline(child, styles, style, out);
                 }
             }
         }
@@ -526,11 +580,10 @@ fn parse_content(content: &str, styles_xml: &str, fallback_title: &str) -> Resul
     for node in body.children().filter(Node::is_element) {
         match (node.tag_name().namespace(), node.tag_name().name()) {
             (Some(NS_TEXT), "h") => {
+                let style_name = attr(node, NS_TEXT, "style-name").unwrap_or("");
                 let level = attr(node, NS_TEXT, "outline-level")
                     .and_then(|s| s.parse::<u32>().ok())
-                    .or_else(|| {
-                        attr(node, NS_TEXT, "style-name").and_then(|s| styles.heading_level(s))
-                    })
+                    .or_else(|| styles.heading_level(style_name))
                     .unwrap_or(1);
                 let text = text_content(node).trim().to_string();
                 if level <= 1 {
@@ -539,7 +592,7 @@ fn parse_content(content: &str, styles_xml: &str, fallback_title: &str) -> Resul
                     } else {
                         bail!("document has more than one H1 heading");
                     }
-                } else {
+                } else if level == 2 {
                     let (number, chapter_title) = parse_chapter_number(&text);
                     let number = number.unwrap_or((chapters.len() + 1) as u32);
                     chapters.push(Chapter {
@@ -548,6 +601,23 @@ fn parse_content(content: &str, styles_xml: &str, fallback_title: &str) -> Resul
                         paragraphs: Vec::new(),
                     });
                     current = Some(chapters.len() - 1);
+                } else {
+                    if current.is_none() {
+                        chapters.push(Chapter {
+                            number: (chapters.len() + 1) as u32,
+                            title: "Untitled".to_string(),
+                            paragraphs: Vec::new(),
+                        });
+                        current = Some(chapters.len() - 1);
+                    }
+                    let mut chars = Vec::new();
+                    extract_inline(node, &styles, TextStyle::default(), &mut chars);
+                    let align = styles.resolved(style_name).align.unwrap_or(Align::Left);
+                    chapters[current.unwrap()].paragraphs.push(Para {
+                        chars,
+                        kind: ParaKind::Subheading,
+                        align,
+                    });
                 }
             }
             (Some(NS_TEXT), "p") => {
@@ -560,7 +630,7 @@ fn parse_content(content: &str, styles_xml: &str, fallback_title: &str) -> Resul
                         } else {
                             bail!("document has more than one H1 heading");
                         }
-                    } else {
+                    } else if level == 2 {
                         let (number, chapter_title) = parse_chapter_number(&text);
                         let number = number.unwrap_or((chapters.len() + 1) as u32);
                         chapters.push(Chapter {
@@ -569,12 +639,34 @@ fn parse_content(content: &str, styles_xml: &str, fallback_title: &str) -> Resul
                             paragraphs: Vec::new(),
                         });
                         current = Some(chapters.len() - 1);
+                    } else {
+                        if current.is_none() {
+                            chapters.push(Chapter {
+                                number: (chapters.len() + 1) as u32,
+                                title: "Untitled".to_string(),
+                                paragraphs: Vec::new(),
+                            });
+                            current = Some(chapters.len() - 1);
+                        }
+                        let mut chars = Vec::new();
+                        extract_inline(node, &styles, TextStyle::default(), &mut chars);
+                        let align = styles.resolved(style_name).align.unwrap_or(Align::Left);
+                        chapters[current.unwrap()].paragraphs.push(Para {
+                            chars,
+                            kind: ParaKind::Subheading,
+                            align,
+                        });
                     }
                     continue;
                 }
                 let mut chars = Vec::new();
-                extract_inline(node, &styles, false, false, &mut chars);
-                let para = Para { chars };
+                extract_inline(node, &styles, TextStyle::default(), &mut chars);
+                let align = styles.resolved(style_name).align.unwrap_or(Align::Justify);
+                let para = Para {
+                    chars,
+                    kind: ParaKind::Body,
+                    align,
+                };
                 if current.is_none() {
                     chapters.push(Chapter {
                         number: (chapters.len() + 1) as u32,
@@ -638,6 +730,7 @@ fn detect_refs(content: &str, styles_xml: &str) -> StyleRefs {
     };
     let mut title_style = None;
     let mut chapter_counts: HashMap<String, usize> = HashMap::new();
+    let mut subheading_counts: HashMap<String, usize> = HashMap::new();
     let mut body_counts: HashMap<String, usize> = HashMap::new();
     for node in body.children().filter(Node::is_element) {
         match (node.tag_name().namespace(), node.tag_name().name()) {
@@ -651,8 +744,10 @@ fn detect_refs(content: &str, styles_xml: &str) -> StyleRefs {
                 let style = attr(node, NS_TEXT, "style-name").unwrap_or("").to_string();
                 if level <= 1 && title_style.is_none() {
                     title_style = Some(style);
-                } else if level >= 2 {
+                } else if level == 2 {
                     *chapter_counts.entry(style).or_default() += 1;
+                } else if level >= 3 {
+                    *subheading_counts.entry(style).or_default() += 1;
                 }
             }
             (Some(NS_TEXT), "p") => {
@@ -660,8 +755,10 @@ fn detect_refs(content: &str, styles_xml: &str) -> StyleRefs {
                 if let Some(level) = styles.heading_level(&style) {
                     if level <= 1 && title_style.is_none() {
                         title_style = Some(style);
-                    } else if level >= 2 {
+                    } else if level == 2 {
                         *chapter_counts.entry(style).or_default() += 1;
+                    } else if level >= 3 {
+                        *subheading_counts.entry(style).or_default() += 1;
                     }
                 } else {
                     *body_counts.entry(style).or_default() += 1;
@@ -677,12 +774,16 @@ fn detect_refs(content: &str, styles_xml: &str) -> StyleRefs {
     let chapter = most_common(chapter_counts)
         .map(|s| base_ref(&s, &styles))
         .unwrap_or_else(|| "Standard".to_string());
+    let subheading = most_common(subheading_counts)
+        .map(|s| base_ref(&s, &styles))
+        .unwrap_or_else(|| chapter.clone());
     let body = most_common(body_counts)
         .map(|s| base_ref(&s, &styles))
         .unwrap_or_else(|| "Standard".to_string());
     StyleRefs {
         title: valid_ref(title, &styles),
         chapter: valid_ref(chapter, &styles),
+        subheading: valid_ref(subheading, &styles),
         body: valid_ref(body, &styles),
     }
 }
@@ -770,9 +871,38 @@ fn write_content(
         "<style:style style:name=\"MydocsBody\" style:family=\"paragraph\" style:parent-style-name=\"{}\"/>\n",
         escape_attr(&refs.body)
     ));
+    out.push_str(&format!(
+        "<style:style style:name=\"MydocsBodyLeft\" style:family=\"paragraph\" style:parent-style-name=\"{}\"><style:paragraph-properties fo:text-align=\"left\"/></style:style>\n",
+        escape_attr(&refs.body)
+    ));
+    out.push_str(&format!(
+        "<style:style style:name=\"MydocsBodyCenter\" style:family=\"paragraph\" style:parent-style-name=\"{}\"><style:paragraph-properties fo:text-align=\"center\"/></style:style>\n",
+        escape_attr(&refs.body)
+    ));
+    out.push_str(&format!(
+        "<style:style style:name=\"MydocsBodyRight\" style:family=\"paragraph\" style:parent-style-name=\"{}\"><style:paragraph-properties fo:text-align=\"right\"/></style:style>\n",
+        escape_attr(&refs.body)
+    ));
+    out.push_str(&format!(
+        "<style:style style:name=\"MydocsSubheading\" style:family=\"paragraph\" style:parent-style-name=\"{}\"><style:paragraph-properties fo:text-align=\"left\"/></style:style>\n",
+        escape_attr(&refs.subheading)
+    ));
+    out.push_str(&format!(
+        "<style:style style:name=\"MydocsSubheadingCenter\" style:family=\"paragraph\" style:parent-style-name=\"{}\"><style:paragraph-properties fo:text-align=\"center\"/></style:style>\n",
+        escape_attr(&refs.subheading)
+    ));
+    out.push_str(&format!(
+        "<style:style style:name=\"MydocsSubheadingRight\" style:family=\"paragraph\" style:parent-style-name=\"{}\"><style:paragraph-properties fo:text-align=\"right\"/></style:style>\n",
+        escape_attr(&refs.subheading)
+    ));
+    out.push_str(&format!(
+        "<style:style style:name=\"MydocsSubheadingJustify\" style:family=\"paragraph\" style:parent-style-name=\"{}\"><style:paragraph-properties fo:text-align=\"justify\"/></style:style>\n",
+        escape_attr(&refs.subheading)
+    ));
     out.push_str("<style:style style:name=\"MydocsBold\" style:family=\"text\"><style:text-properties fo:font-weight=\"bold\"/></style:style>\n");
     out.push_str("<style:style style:name=\"MydocsItalic\" style:family=\"text\"><style:text-properties fo:font-style=\"italic\"/></style:style>\n");
-    out.push_str("<style:style style:name=\"MydocsBoldItalic\" style:family=\"text\"><style:text-properties fo:font-weight=\"bold\" fo:font-style=\"italic\"/></style:style>\n");
+    out.push_str("<style:style style:name=\"MydocsUnderline\" style:family=\"text\"><style:text-properties style:text-underline-style=\"solid\" style:text-underline-width=\"auto\" style:text-underline-color=\"font-color\"/></style:style>\n");
+    out.push_str("<style:style style:name=\"MydocsStrike\" style:family=\"text\"><style:text-properties style:text-line-through-style=\"solid\"/></style:style>\n");
     out.push_str("</office:automatic-styles>\n");
     out.push_str("<office:body><office:text>\n");
     out.push_str(&format!(
@@ -795,10 +925,17 @@ fn write_content(
             encode_text(&heading)
         ));
         for para in &chapter.paragraphs {
-            if para.chars.is_empty() {
-                out.push_str("<text:p text:style-name=\"MydocsBody\"/>\n");
+            let style = paragraph_style(para.kind, para.align);
+            if para.kind == ParaKind::Subheading {
+                out.push_str(&format!(
+                    "<text:h text:style-name=\"{style}\" text:outline-level=\"3\">"
+                ));
+                out.push_str(&encode_runs(&para.chars));
+                out.push_str("</text:h>\n");
+            } else if para.chars.is_empty() {
+                out.push_str(&format!("<text:p text:style-name=\"{style}\"/>\n"));
             } else {
-                out.push_str("<text:p text:style-name=\"MydocsBody\">");
+                out.push_str(&format!("<text:p text:style-name=\"{style}\">"));
                 out.push_str(&encode_runs(&para.chars));
                 out.push_str("</text:p>\n");
             }
@@ -808,30 +945,45 @@ fn write_content(
     Ok(out)
 }
 
+fn paragraph_style(kind: ParaKind, align: Align) -> &'static str {
+    match (kind, align) {
+        (ParaKind::Body, Align::Justify) => "MydocsBody",
+        (ParaKind::Body, Align::Left) => "MydocsBodyLeft",
+        (ParaKind::Body, Align::Center) => "MydocsBodyCenter",
+        (ParaKind::Body, Align::Right) => "MydocsBodyRight",
+        (ParaKind::Subheading, Align::Justify) => "MydocsSubheadingJustify",
+        (ParaKind::Subheading, Align::Left) => "MydocsSubheading",
+        (ParaKind::Subheading, Align::Center) => "MydocsSubheadingCenter",
+        (ParaKind::Subheading, Align::Right) => "MydocsSubheadingRight",
+    }
+}
+
 fn encode_runs(chars: &[StyledChar]) -> String {
     let mut out = String::new();
     let mut i = 0;
     while i < chars.len() {
-        let bold = chars[i].bold;
-        let italic = chars[i].italic;
+        let style = chars[i].style();
         let mut j = i;
-        while j < chars.len() && chars[j].bold == bold && chars[j].italic == italic {
+        while j < chars.len() && chars[j].style() == style {
             j += 1;
         }
         let text = chars[i..j].iter().map(|c| c.ch).collect::<String>();
         let encoded = encode_text(&text);
-        if bold || italic {
-            let style = match (bold, italic) {
-                (true, true) => "MydocsBoldItalic",
-                (true, false) => "MydocsBold",
-                (false, true) => "MydocsItalic",
-                _ => unreachable!(),
-            };
-            out.push_str(&format!(
-                "<text:span text:style-name=\"{style}\">{encoded}</text:span>"
-            ));
-        } else {
-            out.push_str(&encoded);
+        let mut spans = 0;
+        for (enabled, name) in [
+            (style.bold, "MydocsBold"),
+            (style.italic, "MydocsItalic"),
+            (style.underline, "MydocsUnderline"),
+            (style.strike, "MydocsStrike"),
+        ] {
+            if enabled {
+                out.push_str(&format!("<text:span text:style-name=\"{name}\">"));
+                spans += 1;
+            }
+        }
+        out.push_str(&encoded);
+        for _ in 0..spans {
+            out.push_str("</text:span>");
         }
         i = j;
     }
@@ -958,8 +1110,22 @@ mod tests {
         let mut doc = OdtDocument::new("Test Book").unwrap();
         doc.book.chapters[0].title = "First".into();
         doc.book.chapters[0].paragraphs[0] = Para::from_text("Hello bold italic world");
-        doc.book.chapters[0].paragraphs[0].set_style_range(6, 10, true, false);
-        doc.book.chapters[0].paragraphs[0].set_style_range(11, 17, false, true);
+        doc.book.chapters[0].paragraphs[0].set_style_range(
+            6,
+            10,
+            TextStyle {
+                bold: true,
+                ..TextStyle::default()
+            },
+        );
+        doc.book.chapters[0].paragraphs[0].set_style_range(
+            11,
+            17,
+            TextStyle {
+                italic: true,
+                ..TextStyle::default()
+            },
+        );
         doc.book.chapters.push(Chapter::new(2, "Second"));
         doc.book.chapters[1].paragraphs[0] = Para::from_text("Another chapter");
         let bytes = doc.to_bytes().unwrap();
@@ -978,6 +1144,47 @@ mod tests {
         assert!(!p.chars[11].bold && p.chars[11].italic);
         let again = back.to_bytes().unwrap();
         assert_eq!(again.len() > 100, true);
+    }
+
+    #[test]
+    fn roundtrips_decorations_subheadings_alignment_and_line_breaks() {
+        let mut doc = OdtDocument::new("Book").unwrap();
+        doc.book.chapters[0].title = "One".into();
+        let mut para = Para::from_text("under struck\nnext");
+        para.align = Align::Center;
+        para.set_style_range(
+            0,
+            5,
+            TextStyle {
+                underline: true,
+                ..TextStyle::default()
+            },
+        );
+        para.set_style_range(
+            6,
+            12,
+            TextStyle {
+                strike: true,
+                ..TextStyle::default()
+            },
+        );
+        doc.book.chapters[0].paragraphs[0] = para;
+        let mut heading = Para::from_text("Subhead");
+        heading.kind = ParaKind::Subheading;
+        heading.align = Align::Left;
+        doc.book.chapters[0].paragraphs.push(heading);
+
+        let bytes = doc.to_bytes().unwrap();
+        let back = OdtDocument::from_bytes(&bytes, "Book").unwrap();
+        let para = &back.book.chapters[0].paragraphs[0];
+        assert!(para.chars[0].underline);
+        assert!(para.chars[6].strike);
+        assert!(para.chars.iter().any(|c| c.ch == '\n'));
+        assert_eq!(para.align, Align::Center);
+
+        let heading = &back.book.chapters[0].paragraphs[1];
+        assert_eq!(heading.kind, ParaKind::Subheading);
+        assert_eq!(heading.text(), "Subhead");
     }
 
     #[test]

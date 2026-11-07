@@ -7,6 +7,9 @@ mod lock;
 mod model;
 mod nextcloud;
 mod odt;
+mod search;
+mod settings;
+mod theme;
 
 use std::io::{self, Write};
 use std::path::PathBuf;

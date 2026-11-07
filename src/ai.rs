@@ -90,16 +90,7 @@ impl AiConfig {
     }
 
     pub fn masked_key(&self) -> String {
-        let chars: Vec<char> = self.api_key.chars().collect();
-        if chars.is_empty() {
-            "(none)".to_string()
-        } else if chars.len() <= 10 {
-            "********".to_string()
-        } else {
-            let start: String = chars.iter().take(5).collect();
-            let end: String = chars.iter().skip(chars.len() - 4).collect();
-            format!("{start}…{end}")
-        }
+        mask_key(&self.api_key)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -110,6 +101,20 @@ impl AiConfig {
             return Err(anyhow!("ai.toml: model is empty"));
         }
         Ok(())
+    }
+}
+
+/// Mask a secret for display. The full value is never returned.
+pub fn mask_key(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.is_empty() {
+        "(none)".to_string()
+    } else if chars.len() <= 10 {
+        "********".to_string()
+    } else {
+        let start: String = chars.iter().take(5).collect();
+        let end: String = chars.iter().skip(chars.len() - 4).collect();
+        format!("{start}…{end}")
     }
 }
 
@@ -584,6 +589,8 @@ mod tests {
         assert_eq!(cfg.masked_key(), "(none)");
         cfg.api_key = "test-1234567890abcdef".to_string();
         assert_eq!(cfg.masked_key(), "test-…cdef");
+        assert_eq!(mask_key("short"), "********");
+        assert!(!mask_key("sk-1234567890abcdef").contains("1234567890"));
     }
 
     #[test]

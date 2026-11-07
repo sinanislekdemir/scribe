@@ -1,6 +1,6 @@
 use unicode_width::UnicodeWidthChar;
 
-use crate::model::{Book, Para, StyledChar};
+use crate::model::{Align, Book, Para, ParaKind, StyleAttr, StyledChar, TextStyle};
 use crate::odt::OdtDocument;
 
 pub const INDENT: usize = 4;
@@ -52,7 +52,7 @@ struct Snapshot {
 pub struct Editor {
     pub doc: OdtDocument,
     pub cursor: Cursor,
-    pub pending_style: Option<(bool, bool)>,
+    pub pending_style: Option<TextStyle>,
     pub dirty: bool,
     pub revision: u64,
     mark: Option<Cursor>,
@@ -195,17 +195,43 @@ impl Editor {
         });
         if let Some(ch) = self.doc.book.chapters.get(chapter) {
             for (pi, para) in ch.paragraphs.iter().enumerate() {
-                let first_w = self.text_width.saturating_sub(INDENT).max(1);
-                for (li, (start, end)) in wrap_chars(&para.chars, first_w, self.text_width)
-                    .into_iter()
-                    .enumerate()
-                {
+                let indented = para.kind == ParaKind::Body
+                    && matches!(para.align, Align::Justify | Align::Left);
+                let first_w = if indented {
+                    self.text_width.saturating_sub(INDENT).max(1)
+                } else {
+                    self.text_width
+                };
+                let ranges = wrap_chars(&para.chars, first_w, self.text_width);
+                let line_count = ranges.len();
+                for (li, (start, end)) in ranges.into_iter().enumerate() {
+                    let width = visible_width(&para.chars[start..end]);
+                    let indent = match para.align {
+                        Align::Center => self.text_width.saturating_sub(width) / 2,
+                        Align::Right => self.text_width.saturating_sub(width),
+                        Align::Left | Align::Justify => {
+                            if indented && li == 0 {
+                                INDENT
+                            } else {
+                                0
+                            }
+                        }
+                    };
                     lines.push(VisualLine {
                         kind: LineKind::Para,
                         para: pi,
                         start,
                         end,
-                        indent: if li == 0 { INDENT } else { 0 },
+                        indent,
+                    });
+                }
+                if para.kind == ParaKind::Subheading && line_count > 0 {
+                    lines.push(VisualLine {
+                        kind: LineKind::Blank,
+                        para: usize::MAX,
+                        start: 0,
+                        end: 0,
+                        indent: 0,
                     });
                 }
             }
@@ -282,7 +308,7 @@ impl Editor {
             .paragraphs
             .get(para)
             .map(|p| p.style_at(start))
-            .unwrap_or((false, false));
+            .unwrap_or_default();
 
         self.push_undo();
         self.clear_pending();
@@ -296,7 +322,7 @@ impl Editor {
                 start..end,
                 replacement
                     .chars()
-                    .map(|ch| StyledChar::new(ch, style.0, style.1)),
+                    .map(|ch| StyledChar::with_style(ch, style)),
             );
         }
         self.cursor = Cursor {
@@ -428,14 +454,26 @@ impl Editor {
         let Some((start, end)) = self.selection_bounds() else {
             return 0;
         };
+        let count = |para: usize, from: usize, to: usize| {
+            self.doc.book.chapters[self.cursor.chapter]
+                .paragraphs
+                .get(para)
+                .map(|p| {
+                    p.chars[from.min(p.len())..to.min(p.len())]
+                        .iter()
+                        .filter(|c| c.ch != '\n')
+                        .count()
+                })
+                .unwrap_or(0)
+        };
         if start.para == end.para {
-            return end.offset.saturating_sub(start.offset);
+            return count(start.para, start.offset, end.offset);
         }
-        let mut len = self.para_len_at(start.para).saturating_sub(start.offset);
+        let mut len = count(start.para, start.offset, self.para_len_at(start.para));
         for para in start.para + 1..end.para {
-            len += self.para_len_at(para);
+            len += count(para, 0, self.para_len_at(para));
         }
-        len + end.offset
+        len + count(end.para, 0, end.offset)
     }
 
     pub fn is_selected(&self, para: usize, offset: usize) -> bool {
@@ -813,7 +851,7 @@ impl Editor {
         }
     }
 
-    fn insert_style(&self) -> (bool, bool) {
+    fn insert_style(&self) -> TextStyle {
         if let Some(s) = self.pending_style {
             return s;
         }
@@ -829,9 +867,9 @@ impl Editor {
             // stays with the word that precedes it.
             self.push_undo();
         }
-        let (b, i) = self.insert_style();
+        let style = self.insert_style();
         let at = self.cursor.offset;
-        self.para_mut().insert_char(at, ch, b, i);
+        self.para_mut().insert_char(at, ch, style);
         self.cursor.offset += 1;
         self.mark_dirty();
         self.rebuild_current_pages();
@@ -926,7 +964,7 @@ impl Editor {
             return;
         }
         self.begin_edit();
-        let (b, i) = self.insert_style();
+        let style = self.insert_style();
         for ch in text.chars() {
             match ch {
                 '\r' => {}
@@ -943,14 +981,14 @@ impl Editor {
                 '\t' => {
                     for _ in 0..4 {
                         let at = self.cursor.offset;
-                        self.para_mut().insert_char(at, ' ', b, i);
+                        self.para_mut().insert_char(at, ' ', style);
                         self.cursor.offset += 1;
                     }
                 }
                 c if c.is_control() => {}
                 _ => {
                     let at = self.cursor.offset;
-                    self.para_mut().insert_char(at, ch, b, i);
+                    self.para_mut().insert_char(at, ch, style);
                     self.cursor.offset += 1;
                 }
             }
@@ -972,6 +1010,18 @@ impl Editor {
         self.cursor.offset = 0;
         self.mark_dirty();
         self.rebuild_current_pages();
+    }
+
+    /// Shift+Enter: stay in the same ODF paragraph but force a new line.
+    pub fn insert_line_break(&mut self) {
+        self.begin_edit();
+        let style = self.insert_style();
+        let at = self.cursor.offset;
+        self.para_mut().insert_char(at, '\n', style);
+        self.cursor.offset += 1;
+        self.mark_dirty();
+        self.rebuild_current_pages();
+        self.typing_undo = None;
     }
 
     pub fn backspace(&mut self) {
@@ -1135,14 +1185,22 @@ impl Editor {
     }
 
     pub fn toggle_bold(&mut self) {
-        self.toggle_style(true);
+        self.toggle_style(StyleAttr::Bold);
     }
 
     pub fn toggle_italic(&mut self) {
-        self.toggle_style(false);
+        self.toggle_style(StyleAttr::Italic);
     }
 
-    fn selection_all_style(&self, bold: bool) -> bool {
+    pub fn toggle_underline(&mut self) {
+        self.toggle_style(StyleAttr::Underline);
+    }
+
+    pub fn toggle_strike(&mut self) {
+        self.toggle_style(StyleAttr::Strike);
+    }
+
+    fn selection_all_style(&self, attr: StyleAttr) -> bool {
         let Some((start, end)) = self.selection_bounds() else {
             return false;
         };
@@ -1159,8 +1217,7 @@ impl Editor {
             };
             for c in &p.chars[from.min(p.len())..to.min(p.len())] {
                 any = true;
-                let value = if bold { c.bold } else { c.italic };
-                if !value {
+                if !c.style().get(attr) {
                     return false;
                 }
             }
@@ -1168,7 +1225,13 @@ impl Editor {
         any
     }
 
-    fn apply_selection_style(&mut self, start: Cursor, end: Cursor, bold: bool, enabled: bool) {
+    fn apply_selection_style(
+        &mut self,
+        start: Cursor,
+        end: Cursor,
+        attr: StyleAttr,
+        enabled: bool,
+    ) {
         let chapter = &mut self.doc.book.chapters[start.chapter];
         for para in start.para..=end.para {
             let from = if para == start.para { start.offset } else { 0 };
@@ -1178,21 +1241,17 @@ impl Editor {
                 chapter.paragraphs.get(para).map(Para::len).unwrap_or(0)
             };
             if let Some(p) = chapter.paragraphs.get_mut(para) {
-                if bold {
-                    p.set_bold_range(from, to, enabled);
-                } else {
-                    p.set_italic_range(from, to, enabled);
-                }
+                p.set_attr_range(from, to, attr, enabled);
             }
         }
     }
 
-    fn toggle_style(&mut self, bold: bool) {
+    fn toggle_style(&mut self, attr: StyleAttr) {
         if let Some((start, end)) = self.selection_bounds() {
             self.push_undo();
             self.clear_pending();
-            let enabled = !self.selection_all_style(bold);
-            self.apply_selection_style(start, end, bold, enabled);
+            let enabled = !self.selection_all_style(attr);
+            self.apply_selection_style(start, end, attr, enabled);
             self.cursor = end;
             self.clear_selection();
             self.mark_dirty();
@@ -1206,34 +1265,25 @@ impl Editor {
             self.push_undo();
             let all = self.para().chars[start..end]
                 .iter()
-                .all(|c| if bold { c.bold } else { c.italic });
+                .all(|c| c.style().get(attr));
             let enabled = !all;
-            if bold {
-                self.para_mut().set_bold_range(start, end, enabled);
-            } else {
-                self.para_mut().set_italic_range(start, end, enabled);
-            }
+            self.para_mut().set_attr_range(start, end, attr, enabled);
             self.cursor.offset = end;
-            let c = self.para().chars[start];
-            self.pending_style = Some((c.bold, c.italic));
+            self.pending_style = Some(self.para().chars[start].style());
             self.mark_dirty();
             self.rebuild_current_pages();
         } else {
-            let (mut b, mut i) = self
+            let mut style = self
                 .pending_style
                 .unwrap_or_else(|| self.para().style_at(self.cursor.offset));
-            if bold {
-                b = !b;
-            } else {
-                i = !i;
-            }
-            self.pending_style = Some((b, i));
+            style = style.toggled(attr);
+            self.pending_style = Some(style);
         }
     }
 
-    pub fn status_style(&self) -> (bool, bool) {
-        if let Some(s) = self.pending_style {
-            return s;
+    pub fn status_style(&self) -> TextStyle {
+        if let Some(style) = self.pending_style {
+            return style;
         }
         let p = self.para();
         let off = self.cursor.offset;
@@ -1244,6 +1294,70 @@ impl Editor {
         } else {
             p.style_at(off)
         }
+    }
+
+    fn selection_paragraphs(&self) -> (usize, usize) {
+        self.selection_bounds()
+            .map(|(start, end)| (start.para, end.para))
+            .unwrap_or((self.cursor.para, self.cursor.para))
+    }
+
+    /// Toggle the current paragraph (or every paragraph touching the
+    /// selection) between body text and an H3 subheading.
+    pub fn toggle_subheading(&mut self) -> bool {
+        let (first, last) = self.selection_paragraphs();
+        let make_subheading = !(first..=last).all(|para| {
+            self.doc.book.chapters[self.cursor.chapter]
+                .paragraphs
+                .get(para)
+                .is_some_and(|p| p.kind == ParaKind::Subheading)
+        });
+        self.push_undo();
+        self.clear_pending();
+        for para in first..=last {
+            if let Some(p) = self.doc.book.chapters[self.cursor.chapter]
+                .paragraphs
+                .get_mut(para)
+            {
+                p.kind = if make_subheading {
+                    ParaKind::Subheading
+                } else {
+                    ParaKind::Body
+                };
+                if make_subheading && p.align == Align::Justify {
+                    p.align = Align::Left;
+                }
+            }
+        }
+        self.clear_selection();
+        self.mark_dirty();
+        self.rebuild_all_pages();
+        make_subheading
+    }
+
+    pub fn set_alignment(&mut self, align: Align) {
+        let (first, last) = self.selection_paragraphs();
+        self.push_undo();
+        self.clear_pending();
+        for para in first..=last {
+            if let Some(p) = self.doc.book.chapters[self.cursor.chapter]
+                .paragraphs
+                .get_mut(para)
+            {
+                p.align = align;
+            }
+        }
+        self.clear_selection();
+        self.mark_dirty();
+        self.rebuild_current_pages();
+    }
+
+    pub fn current_alignment(&self) -> Align {
+        self.para().align
+    }
+
+    pub fn current_is_subheading(&self) -> bool {
+        self.para().kind == ParaKind::Subheading
     }
 
     pub fn create_chapter(&mut self, title: String) {
@@ -1322,6 +1436,14 @@ fn is_closing_punct(c: char) -> bool {
     )
 }
 
+fn visible_width(chars: &[StyledChar]) -> usize {
+    chars
+        .iter()
+        .filter(|c| c.ch != '\n')
+        .map(|c| c.ch.width().unwrap_or(0))
+        .sum()
+}
+
 fn wrap_chars(chars: &[StyledChar], first_width: usize, width: usize) -> Vec<(usize, usize)> {
     if chars.is_empty() {
         return vec![(0, 0)];
@@ -1330,6 +1452,13 @@ fn wrap_chars(chars: &[StyledChar], first_width: usize, width: usize) -> Vec<(us
     let mut start = 0;
     let mut first = true;
     while start < chars.len() {
+        // A line break creates an empty visual line when it starts one.
+        if chars[start].ch == '\n' {
+            out.push((start, start));
+            start += 1;
+            first = false;
+            continue;
+        }
         let avail = if first {
             first_width.max(1)
         } else {
@@ -1339,6 +1468,9 @@ fn wrap_chars(chars: &[StyledChar], first_width: usize, width: usize) -> Vec<(us
         let mut end = start;
         let mut last_space = None;
         while end < chars.len() {
+            if chars[end].ch == '\n' {
+                break;
+            }
             let cw = chars[end].ch.width().unwrap_or(0);
             if w + cw > avail {
                 break;
@@ -1351,7 +1483,7 @@ fn wrap_chars(chars: &[StyledChar], first_width: usize, width: usize) -> Vec<(us
         }
         if end == start {
             end = start + 1;
-        } else if end < chars.len() {
+        } else if end < chars.len() && chars[end].ch != '\n' {
             if let Some(sp) = last_space {
                 if sp > start && sp < end {
                     end = sp;
@@ -1360,7 +1492,7 @@ fn wrap_chars(chars: &[StyledChar], first_width: usize, width: usize) -> Vec<(us
         }
         out.push((start, end));
         if end < chars.len() {
-            if chars[end].ch == ' ' {
+            if matches!(chars[end].ch, '\n' | ' ') {
                 start = end + 1;
             } else {
                 start = end;
@@ -1431,7 +1563,14 @@ mod tests {
         for ch in "ve ve devam".chars() {
             ed.insert_char(ch);
         }
-        ed.doc.book.chapters[0].paragraphs[0].set_style_range(3, 5, true, false);
+        ed.doc.book.chapters[0].paragraphs[0].set_style_range(
+            3,
+            5,
+            TextStyle {
+                bold: true,
+                ..TextStyle::default()
+            },
+        );
         assert!(ed.replace_span(0, 3, 5, "ve", "VE"));
         let para = &ed.doc.book.chapters[0].paragraphs[0];
         assert_eq!(para.text(), "ve VE devam");
@@ -1523,6 +1662,93 @@ mod tests {
         assert!(chars[..5].iter().all(|c| c.bold));
         assert!(chars[5..].iter().all(|c| !c.bold));
         assert!(!ed.has_selection());
+    }
+
+    #[test]
+    fn underline_and_strike_apply_to_marked_range() {
+        let doc = OdtDocument::new("Test").unwrap();
+        let mut ed = Editor::new(doc, 80, 24);
+        for ch in "Hello world".chars() {
+            ed.insert_char(ch);
+        }
+        ed.cursor.offset = 0;
+        ed.toggle_mark();
+        ed.cursor.offset = 5;
+        ed.toggle_mark();
+        ed.toggle_underline();
+        ed.cursor.offset = 6;
+        ed.toggle_mark();
+        ed.cursor.offset = 11;
+        ed.toggle_mark();
+        ed.toggle_strike();
+        let chars = &ed.doc.book.chapters[0].paragraphs[0].chars;
+        assert!(chars[..5].iter().all(|c| c.underline));
+        assert!(chars[6..11].iter().all(|c| c.strike));
+        assert!(!chars[0].strike);
+    }
+
+    #[test]
+    fn line_break_stays_inside_the_paragraph() {
+        let doc = OdtDocument::new("Test").unwrap();
+        let mut ed = Editor::new(doc, 80, 24);
+        for ch in "first".chars() {
+            ed.insert_char(ch);
+        }
+        ed.insert_line_break();
+        for ch in "second".chars() {
+            ed.insert_char(ch);
+        }
+        assert_eq!(ed.doc.book.chapters[0].paragraphs.len(), 1);
+        assert_eq!(
+            ed.doc.book.chapters[0].paragraphs[0].text(),
+            "first\nsecond"
+        );
+        assert_eq!(
+            ed.lines()
+                .iter()
+                .filter(|line| line.kind == LineKind::Para)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn alignment_offsets_short_lines() {
+        let doc = OdtDocument::new("Test").unwrap();
+        let mut ed = Editor::new(doc, 80, 24);
+        for ch in "centered".chars() {
+            ed.insert_char(ch);
+        }
+        ed.set_alignment(Align::Center);
+        let line = ed
+            .lines()
+            .iter()
+            .find(|line| line.kind == LineKind::Para)
+            .unwrap();
+        assert!(line.indent > 0);
+        ed.set_alignment(Align::Right);
+        let line = ed
+            .lines()
+            .iter()
+            .find(|line| line.kind == LineKind::Para)
+            .unwrap();
+        assert!(line.indent + "centered".len() == ed.text_width());
+    }
+
+    #[test]
+    fn subheading_toggle_preserves_order() {
+        let doc = OdtDocument::new("Test").unwrap();
+        let mut ed = Editor::new(doc, 80, 24);
+        for ch in "Heading".chars() {
+            ed.insert_char(ch);
+        }
+        assert!(ed.toggle_subheading());
+        assert_eq!(
+            ed.doc.book.chapters[0].paragraphs[0].kind,
+            ParaKind::Subheading
+        );
+        assert!(!ed.toggle_subheading());
+        assert_eq!(ed.doc.book.chapters[0].paragraphs[0].kind, ParaKind::Body);
     }
 
     #[test]
