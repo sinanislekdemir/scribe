@@ -5,6 +5,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -31,6 +32,11 @@ use crate::theme::{Palette, ThemeName};
 const APP_AUTHOR: &str = env!("CARGO_PKG_AUTHORS");
 const APP_REPO: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_LICENSE: &str = env!("CARGO_PKG_LICENSE");
+
+const STATUS_CLOCK_FULL: &str = "%Y-%m-%d %H:%M";
+const STATUS_CLOCK_TIME: &str = "%H:%M";
+const STATUS_CLOCK_GAP: usize = 2;
+const STATUS_CLOCK_MIN_WIDTH: u16 = 30;
 
 fn app_version() -> &'static str {
     option_env!("SCRIBE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
@@ -884,6 +890,7 @@ pub struct App {
     notes_doc: Option<DocMemory>,
     pending_notes: Option<PendingNotes>,
     search: SearchState,
+    clock_minute: i64,
 }
 
 impl App {
@@ -955,6 +962,7 @@ impl App {
             notes_doc: None,
             pending_notes: None,
             search: SearchState::default(),
+            clock_minute: current_minute(),
         };
         app.refresh_file_picker();
         Ok(app)
@@ -1020,6 +1028,7 @@ impl App {
             notes_doc: None,
             pending_notes: None,
             search: SearchState::default(),
+            clock_minute: current_minute(),
         };
         if path.exists() {
             let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
@@ -1882,6 +1891,11 @@ impl App {
 
     fn tick(&mut self) -> bool {
         let mut changed = false;
+        let minute = current_minute();
+        if minute != self.clock_minute {
+            self.clock_minute = minute;
+            changed = true;
+        }
         if let Some((_, until)) = &self.toast {
             if Instant::now() > *until {
                 self.toast = None;
@@ -5405,10 +5419,36 @@ impl App {
                 Style::default().fg(p.dim),
             ));
         }
+        let left_width: usize = spans
+            .iter()
+            .map(|span| text_width(span.content.as_ref()))
+            .sum();
+        let now = Local::now();
+        let clock_full = now.format(STATUS_CLOCK_FULL).to_string();
+        let clock_time = now.format(STATUS_CLOCK_TIME).to_string();
+        let clock = pick_status_clock(&clock_full, &clock_time, left_width, rect.width);
+        let reserved = clock
+            .map(|text| text_width(text) + STATUS_CLOCK_GAP + 1)
+            .unwrap_or(0);
+        let left_area = Rect {
+            width: rect.width.saturating_sub(reserved as u16),
+            ..rect
+        };
         frame.render_widget(
             Paragraph::new(Line::from(spans)).style(Style::default().bg(p.bar_bg)),
-            rect,
+            left_area,
         );
+        if let Some(clock) = clock {
+            let clock_width = text_width(clock);
+            let x = rect.x + rect.width.saturating_sub(clock_width as u16 + 1);
+            frame.buffer_mut().set_stringn(
+                x,
+                rect.y,
+                clock,
+                clock_width,
+                Style::default().bg(p.bar_bg).fg(p.dim),
+            );
+        }
     }
 
     fn draw_about(&self, frame: &mut Frame) {
@@ -6181,6 +6221,27 @@ fn text_width(value: &str) -> usize {
         .sum()
 }
 
+fn current_minute() -> i64 {
+    Local::now().timestamp() / 60
+}
+
+/// Pick the right-aligned status-bar clock. Date and time together are shown
+/// only when they fit beside `left_width`; otherwise fall back to the time
+/// alone. Below `STATUS_CLOCK_MIN_WIDTH` the bar stays clock-free.
+fn pick_status_clock<'a>(
+    full: &'a str,
+    time: &'a str,
+    left_width: usize,
+    width: u16,
+) -> Option<&'a str> {
+    if width < STATUS_CLOCK_MIN_WIDTH {
+        return None;
+    }
+    let available = width as usize;
+    let fits = |text: &str| left_width + STATUS_CLOCK_GAP + text_width(text) + 1 <= available;
+    Some(if fits(full) { full } else { time })
+}
+
 fn search_byte_at(value: &str, char_idx: usize) -> usize {
     value
         .char_indices()
@@ -6442,5 +6503,23 @@ mod tests {
             Some("My.Book_1700000000_2.odt")
         );
         assert_eq!(fs::read(&third).unwrap(), b"three");
+    }
+
+    #[test]
+    fn status_clock_falls_back_to_time_when_date_and_time_do_not_fit() {
+        let full = "2026-11-08 14:32";
+        let time = "14:32";
+
+        // Room for both next to the left content.
+        assert_eq!(pick_status_clock(full, time, 40, 100), Some(full));
+        // Date and time would collide with the left content; keep the time.
+        assert_eq!(pick_status_clock(full, time, 62, 80), Some(time));
+        // Even the time does not fit beside the left content; still prefer it
+        // and let the left side clip rather than drop the clock.
+        assert_eq!(pick_status_clock(full, time, 34, 40), Some(time));
+        // Very narrow terminals stay clock-free.
+        assert_eq!(pick_status_clock(full, time, 4, 29), None);
+        // A short left side leaves room for the full timestamp on 30 columns.
+        assert_eq!(pick_status_clock(full, time, 4, 30), Some(full));
     }
 }
