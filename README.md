@@ -4,6 +4,22 @@ A focused terminal editor for long-form prose stored as **ODT**. It works with l
 
 Author: Sinan Islekdemir <sinan@islekdemir.com> · Repository: <https://github.com/sinanislekdemir/scribe> · License: MIT
 
+## Why?
+
+I have a few old laptops from around 2010. I like their keyboards and their
+size, and my MacBook runs Linux. I refurbished it with a bit more RAM and a new
+battery. I also have a workstation. The workstation is fine, but the laptop
+does not have enough resources to run modern cloud-based word processors like
+Microsoft 365 Word or Google Docs. Google Docs is also poor at Turkish support.
+
+So I wanted a very lightweight, cloud-backed editor for my needs. What can be
+lighter than a terminal app? It does not even require X11 or Wayland, it runs in
+tty mode, and it still syncs the document to my self-hosted cloud. I can work on
+the same text at home and on the go.
+
+scribe solves those requirements. If it works for others, good. I do not intend
+to turn it into a full word processor.
+
 Built for a narrow document shape:
 
 - one H1 = book title
