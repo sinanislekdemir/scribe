@@ -68,6 +68,7 @@ pub struct Editor {
     lines: Vec<VisualLine>,
     chapter_pages: Vec<usize>,
     pub page: usize,
+    view_start: usize,
     pub total_pages: usize,
     pub total_words: usize,
     pub total_chars: usize,
@@ -91,6 +92,7 @@ impl Editor {
             lines: Vec::new(),
             chapter_pages: Vec::new(),
             page: 0,
+            view_start: 0,
             total_pages: 0,
             total_words: 0,
             total_chars: 0,
@@ -130,6 +132,7 @@ impl Editor {
         }
         self.total_pages = self.chapter_pages.iter().sum();
         self.rebuild_lines();
+        self.sync_page();
     }
 
     pub fn rebuild_current_pages(&mut self) {
@@ -147,6 +150,7 @@ impl Editor {
 
     fn rebuild_lines(&mut self) {
         self.lines = self.wrap_chapter(self.cursor.chapter);
+        self.view_start = self.view_start.min(self.lines.len().saturating_sub(1));
         if self.page >= self.chapter_pages() {
             self.page = self.chapter_pages().saturating_sub(1);
         }
@@ -164,7 +168,7 @@ impl Editor {
     }
 
     pub fn page_start(&self) -> usize {
-        self.page * self.page_height
+        self.view_start
     }
 
     pub fn page_lines(&self) -> &[VisualLine] {
@@ -399,12 +403,19 @@ impl Editor {
     pub fn sync_page(&mut self) {
         if self.lines.is_empty() {
             self.page = 0;
+            self.view_start = 0;
             return;
         }
         let line = self.cursor_line();
+        self.view_start = scrolled_view_start(line, self.view_start, self.page_height);
         let max_page = self.chapter_pages().saturating_sub(1);
-        let wanted = line / self.page_height;
+        let wanted = line / self.page_height.max(1);
         self.page = wanted.min(max_page);
+    }
+
+    fn scroll_step(&self) -> usize {
+        let height = self.page_height.max(1);
+        height - height / 4
     }
 
     pub fn chapter_word_count(&self, i: usize) -> usize {
@@ -785,10 +796,20 @@ impl Editor {
 
     pub fn page_down(&mut self) {
         self.begin_move();
-        let target_start = (self.page + 1) * self.page_height;
-        let next_line =
-            (target_start..self.lines.len()).find(|&i| self.lines[i].kind == LineKind::Para);
-        if let Some(idx) = next_line {
+        let height = self.page_height.max(1);
+        let step = self.scroll_step();
+        let max_start = self.lines.len().saturating_sub(height);
+        let target = (self.view_start + step).min(max_start);
+        if target == self.view_start && self.view_start + height >= self.lines.len() {
+            if self.cursor.chapter + 1 < self.doc.book.chapters.len() {
+                self.goto_chapter(self.cursor.chapter + 1);
+            }
+            return;
+        }
+        self.view_start = target;
+        if let Some(idx) =
+            (target..self.lines.len()).find(|&i| self.lines[i].kind == LineKind::Para)
+        {
             self.set_cursor_on_line(idx, 0);
         } else if self.cursor.chapter + 1 < self.doc.book.chapters.len() {
             self.goto_chapter(self.cursor.chapter + 1);
@@ -798,27 +819,36 @@ impl Editor {
 
     pub fn page_up(&mut self) {
         self.begin_move();
-        let previous_end = self.page * self.page_height;
-        let prev_line = (0..previous_end)
-            .rev()
-            .find(|&i| self.lines[i].kind == LineKind::Para);
-        if let Some(idx) = prev_line {
-            self.set_cursor_on_line(idx, self.text_width);
-        } else if self.cursor.chapter > 0 {
-            let ch = self.cursor.chapter - 1;
-            self.goto_chapter(ch);
-            self.page = self.chapter_pages().saturating_sub(1);
-            let start = self.page * self.page_height;
-            if let Some(idx) =
-                (start..self.lines.len()).find(|&i| self.lines[i].kind == LineKind::Para)
-            {
-                self.set_cursor_on_line(idx, 0);
-            } else if let Some(idx) = (0..self.lines.len())
-                .rev()
-                .find(|&i| self.lines[i].kind == LineKind::Para)
-            {
-                self.set_cursor_on_line(idx, self.text_width);
+        let height = self.page_height.max(1);
+        if self.view_start == 0 {
+            if self.cursor.chapter > 0 {
+                let chapter = self.cursor.chapter - 1;
+                self.goto_chapter(chapter);
+                let max_start = self.lines.len().saturating_sub(height);
+                self.view_start = max_start;
+                if let Some(idx) = (max_start..self.lines.len())
+                    .rev()
+                    .find(|&i| self.lines[i].kind == LineKind::Para)
+                    .or_else(|| {
+                        (0..self.lines.len())
+                            .rev()
+                            .find(|&i| self.lines[i].kind == LineKind::Para)
+                    })
+                {
+                    self.set_cursor_on_line(idx, self.text_width);
+                }
             }
+            self.sync_page();
+            return;
+        }
+        let target = self.view_start.saturating_sub(self.scroll_step());
+        self.view_start = target;
+        let end = (target + height).min(self.lines.len());
+        if let Some(idx) = (target..end)
+            .rev()
+            .find(|&i| self.lines[i].kind == LineKind::Para)
+        {
+            self.set_cursor_on_line(idx, self.text_width);
         }
         self.sync_page();
     }
@@ -835,6 +865,7 @@ impl Editor {
             offset: 0,
         };
         self.page = 0;
+        self.view_start = 0;
         self.rebuild_lines();
         self.sync_page();
     }
@@ -1436,6 +1467,23 @@ fn is_closing_punct(c: char) -> bool {
     )
 }
 
+/// Keep the cursor visible while scrolling in 75% steps, retaining the last
+/// 25% of the previous viewport above the cursor.
+fn scrolled_view_start(line: usize, view_start: usize, page_height: usize) -> usize {
+    let height = page_height.max(1);
+    let overlap = height / 4;
+    let step = (height - overlap).max(1);
+    let mut start = view_start;
+    if line < start {
+        start = line.saturating_sub(overlap);
+    } else if line >= start + height {
+        while line >= start + height {
+            start = start.saturating_add(step);
+        }
+    }
+    start
+}
+
 fn visible_width(chars: &[StyledChar]) -> usize {
     chars
         .iter()
@@ -1511,6 +1559,17 @@ mod tests {
 
     fn chars(s: &str) -> Vec<StyledChar> {
         s.chars().map(StyledChar::plain).collect()
+    }
+
+    #[test]
+    fn viewport_scrolls_75_percent_with_25_percent_overlap() {
+        let height = 24;
+        assert_eq!(scrolled_view_start(23, 0, height), 0);
+        assert_eq!(scrolled_view_start(24, 0, height), 18);
+        assert_eq!(scrolled_view_start(25, 18, height), 18);
+        assert_eq!(scrolled_view_start(42, 18, height), 36);
+        assert_eq!(scrolled_view_start(30, 36, height), 24);
+        assert_eq!(scrolled_view_start(0, 36, height), 0);
     }
 
     #[test]

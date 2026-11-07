@@ -33,7 +33,7 @@ Built for a narrow document shape:
 - a notes sidecar document (`.notes.odt`) toggled with `F7`
 - built-in case-insensitive find (`F3`) with no replace
 
-The TUI is intentionally small: one chapter at a time, a centered 120-column text area, terminal-sized pages, total word/char/page counts, and autosave.
+The TUI is intentionally small: one chapter at a time, a centered 120-column text area, terminal-sized pages, total word/char/page counts, and autosave. When the cursor crosses the bottom of the page, the view scrolls forward by 75%, keeping the last 25% of the previous page visible for context.
 
 <p align="center">
   <img src="assets/scribe1.png" alt="scribe editing a book chapter" width="100%">
