@@ -336,6 +336,17 @@ The old credentials file is left in place.
 
 If the screen gets corrupted by another process writing to the same terminal (browser logs, background jobs, etc.), press `Ctrl+L` to force a full redraw. Browser launches during login now have their stdin/stdout/stderr detached, so they should not write into the TUI. If a previously launched browser already owns that terminal, close it or start `scribe` in a fresh terminal/tmux session.
 
+## Releasing
+
+Bump the version in `Cargo.toml`, commit it, then push a matching tag:
+
+```bash
+git tag -a v0.1.1 -m "scribe v0.1.1"
+git push origin v0.1.1
+```
+
+The release workflow checks that the tag matches `Cargo.toml`, builds static Linux x86_64/arm64 binaries plus a macOS universal binary, and publishes the tarballs with `SHA256SUMS` on the Releases page.
+
 ## Development
 
 ```bash
