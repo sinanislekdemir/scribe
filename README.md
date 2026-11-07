@@ -14,6 +14,26 @@ Built for a narrow document shape:
 
 The TUI is intentionally small: one chapter at a time, a centered 120-column text area, terminal-sized pages, total word/char/page counts, and autosave.
 
+<p align="center">
+  <img src="assets/scribe1.png" alt="scribe editing a book chapter" width="100%">
+  <br>
+  <em>One chapter at a time, with live word/char/page counts and autosave status.</em>
+</p>
+
+## Screenshots
+
+**Chapter menu** — `F9` opens the menu bar; the `Chapter` menu creates, renames, and navigates chapters.
+
+![Chapter menu](assets/scribe2.png)
+
+**AI writing check** — `F8` sends the current chapter to an OpenAI-compatible endpoint and lists suggestions for explicit approval.
+
+![AI writing check](assets/scribe3.png)
+
+**About** — `Alt+A` shows the version, author, repository, and license.
+
+![About scribe](assets/scribe4.png)
+
 ## Build
 
 ```bash
