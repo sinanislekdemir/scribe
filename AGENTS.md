@@ -73,7 +73,7 @@ scribe roundtrip in.odt out.odt
 - Find: `F3` (or `Edit → Find…`) opens a one-line status-bar prompt. Typing edits the query; `Enter` searches from the cursor, `F3` finds the next match, and `Esc` closes the prompt while leaving the cursor at the last match. Search is always case-insensitive, runs over the whole active document, wraps at the end, never crosses paragraph boundaries, and treats soft line breaks as spaces. The query is capped to the available status-bar width and never scrolls. There is no replace. Reset search state whenever the active document changes.
 - Page background is the theme's `page_bg` with dim `│` rules on both sides. Do not reduce the document text width for the rules; they sit outside the text area.
 - Cursor is a **drawn block** using the theme's `cursor_bg`/`cursor_fg`. The native terminal cursor is hidden in `run_tui`. Do **not** call `frame.set_cursor_position` for the editor/prompt cursor again: that causes double inversion on block-cursor terminals and makes the cursor look like only a character color change.
-- A marked range paints the theme's `selection_bg` behind its characters and shows `SEL n` in the status bar. The cursor block still draws over the endpoint.
+- A marked range paints the theme's `selection_bg` behind its characters and shows words and characters (`SEL 5w · 23c`) in the status bar. The selection popup shows the same counts. The cursor block still draws over the endpoint.
 - Cursor must always stay in the viewport after moves, edits, page flips, chapter jumps, and resize.
 - `Ctrl+L` requests a full terminal clear + redraw. External processes writing to the TTY can corrupt ratatui’s diff and persist garbage; `Ctrl+L` is the recovery path.
 - Browser launches during login must detach stdio to `/dev/null` and not wait. Firefox/Glean logs inheriting the TTY will corrupt the TUI.
@@ -192,7 +192,7 @@ tmux send-keys -t smoke BSpace C-z
 tmux send-keys -t smoke C-q
 ```
 
-Check that the menu bar occupies the first row, the dropdown overlaps the editor without moving the page borders, disabled items are dim, `F9`/`Esc` close the menu, and the cursor returns after closing. For marking, check the `SELECTION_BG` highlight and `SEL n` status, that `Backspace` removes the range, `Esc` clears it, and undo restores it. Use a temporary `XDG_CACHE_HOME` when testing backups/cache.
+Check that the menu bar occupies the first row, the dropdown overlaps the editor without moving the page borders, disabled items are dim, `F9`/`Esc` close the menu, and the cursor returns after closing. For marking, check the `SELECTION_BG` highlight and `SEL <words>w · <chars>c` status, that `Backspace` removes the range, `Esc` clears it, and undo restores it. Use a temporary `XDG_CACHE_HOME` when testing backups/cache.
 
 ## Current limitations / do not add unless asked
 

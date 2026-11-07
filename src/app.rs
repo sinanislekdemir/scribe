@@ -2803,10 +2803,15 @@ impl App {
         };
         match result {
             MarkResult::Started => self.toast("Mark set. Move, then Ctrl+Space again."),
-            MarkResult::Finished(count) => {
+            MarkResult::Finished(_) => {
+                let (words, chars) = self
+                    .editor
+                    .as_ref()
+                    .map(|editor| (editor.selection_word_count(), editor.selection_len()))
+                    .unwrap_or((0, 0));
                 self.selection_menu = Some(SelectionMenu::default());
                 self.overlay = Overlay::Selection;
-                self.toast(format!("{count} chars selected."));
+                self.toast(format!("{words} words · {chars} chars selected."));
             }
             MarkResult::Restarted => self.toast("New mark set at cursor."),
             MarkResult::Cancelled => self.toast("Empty mark cleared."),
@@ -4840,11 +4845,11 @@ impl App {
         let height = (SELECTION_ACTIONS.len() as u16 + 6).min(area.height);
         let rect = centered(area, 52.min(area.width), height);
         frame.render_widget(Clear, rect);
-        let count = self
+        let (words, chars) = self
             .editor
             .as_ref()
-            .map(|editor| editor.selection_len())
-            .unwrap_or(0);
+            .map(|editor| (editor.selection_word_count(), editor.selection_len()))
+            .unwrap_or((0, 0));
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(p.page_border))
@@ -4861,7 +4866,7 @@ impl App {
         buf.set_stringn(
             inner.x,
             inner.y,
-            format!(" {count} characters selected"),
+            format!(" {words} words · {chars} chars selected"),
             inner.width as usize,
             Style::default().fg(p.dim),
         );
@@ -5305,7 +5310,11 @@ impl App {
             if ed.has_selection() {
                 spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
                 spans.push(Span::styled(
-                    format!("SEL {}", fmt_num(ed.selection_len())),
+                    format!(
+                        "SEL {}w · {}c",
+                        fmt_num(ed.selection_word_count()),
+                        fmt_num(ed.selection_len())
+                    ),
                     Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
                 ));
             }

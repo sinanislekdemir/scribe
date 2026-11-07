@@ -487,6 +487,37 @@ impl Editor {
         len + count(end.para, 0, end.offset)
     }
 
+    pub fn selection_word_count(&self) -> usize {
+        let Some((start, end)) = self.selection_bounds() else {
+            return 0;
+        };
+        let mut words = 0;
+        for para in start.para..=end.para {
+            let from = if para == start.para { start.offset } else { 0 };
+            let to = if para == end.para {
+                end.offset
+            } else {
+                self.para_len_at(para)
+            };
+            let Some(p) = self.doc.book.chapters[self.cursor.chapter]
+                .paragraphs
+                .get(para)
+            else {
+                continue;
+            };
+            let mut in_word = false;
+            for c in &p.chars[from.min(p.len())..to.min(p.len())] {
+                if c.ch.is_whitespace() {
+                    in_word = false;
+                } else if !in_word {
+                    words += 1;
+                    in_word = true;
+                }
+            }
+        }
+        words
+    }
+
     pub fn is_selected(&self, para: usize, offset: usize) -> bool {
         let Some((start, end)) = self.selection_bounds() else {
             return false;
@@ -1703,6 +1734,29 @@ mod tests {
         ed.insert_typed_char('!');
         assert_eq!(ed.doc.book.chapters[0].paragraphs[0].text(), "Hello!");
         assert!(!ed.has_selection());
+    }
+
+    #[test]
+    fn selection_reports_words_and_chars() {
+        let doc = OdtDocument::new("Test").unwrap();
+        let mut ed = Editor::new(doc, 80, 24);
+        for ch in "Hello world".chars() {
+            ed.insert_char(ch);
+        }
+        ed.cursor.offset = 0;
+        ed.toggle_mark();
+        ed.cursor.offset = 11;
+        ed.toggle_mark();
+        assert_eq!(ed.selection_word_count(), 2);
+        assert_eq!(ed.selection_len(), 11);
+
+        ed.clear_selection();
+        ed.cursor.offset = 5;
+        ed.toggle_mark();
+        ed.cursor.offset = 6;
+        ed.toggle_mark();
+        assert_eq!(ed.selection_word_count(), 0);
+        assert_eq!(ed.selection_len(), 1);
     }
 
     #[test]
