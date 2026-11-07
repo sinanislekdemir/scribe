@@ -1046,13 +1046,20 @@ impl App {
     }
 
     pub fn run(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<()> {
+        let mut redraw = true;
         loop {
             if self.redraw_requested {
                 terminal.clear()?;
                 self.redraw_requested = false;
+                redraw = true;
             }
-            terminal.draw(|f| self.draw(f))?;
-            if event::poll(Duration::from_millis(80))? {
+            if redraw {
+                terminal.draw(|f| self.draw(f))?;
+                redraw = false;
+            }
+            let mut changed = false;
+            if event::poll(Duration::from_millis(250))? {
+                changed = true;
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
                     Event::Paste(text) => {
@@ -1075,12 +1082,15 @@ impl App {
                     _ => {}
                 }
             }
-            self.drain_net();
-            self.drain_lock();
-            self.drain_ai();
-            self.tick();
+            changed |= self.drain_net();
+            changed |= self.drain_lock();
+            changed |= self.drain_ai();
+            changed |= self.tick();
             if self.quit {
                 break;
+            }
+            if changed {
+                redraw = true;
             }
         }
         Ok(())
@@ -1145,12 +1155,14 @@ impl App {
         self.toast = Some((msg.into(), Instant::now() + Duration::from_secs(4)));
     }
 
-    fn drain_net(&mut self) {
+    fn drain_net(&mut self) -> bool {
+        let mut changed = false;
         loop {
             let ev = match self.net_rx.try_recv() {
                 Ok(ev) => ev,
                 Err(_) => break,
             };
+            changed = true;
             match ev {
                 NetEvent::Listed { path, result } => {
                     if let Some(fp) = &mut self.file_picker {
@@ -1409,18 +1421,22 @@ impl App {
                 }
             }
         }
+        changed
     }
 
-    fn drain_lock(&mut self) {
+    fn drain_lock(&mut self) -> bool {
+        let mut changed = false;
         if self.exit_mode.is_some() {
             while let Ok(event) = self.lock_rx.try_recv() {
+                changed = true;
                 if let LockEvent::Acquired { handle, .. } = event {
                     self.release_orphan(&handle);
                 }
             }
-            return;
+            return changed;
         }
         while let Ok(event) = self.lock_rx.try_recv() {
+            changed = true;
             match event {
                 LockEvent::Acquired { path, handle } => self.on_lock_acquired(path, handle),
                 LockEvent::Held { path, held } => self.on_lock_held(path, held),
@@ -1431,6 +1447,7 @@ impl App {
                 LockEvent::Error { path, message } => self.on_lock_error(path, message),
             }
         }
+        changed
     }
 
     fn pending_matches(&self, path: &str) -> bool {
@@ -1863,26 +1880,29 @@ impl App {
         }
     }
 
-    fn tick(&mut self) {
+    fn tick(&mut self) -> bool {
+        let mut changed = false;
         if let Some((_, until)) = &self.toast {
             if Instant::now() > *until {
                 self.toast = None;
+                changed = true;
             }
         }
         if self.exit_mode.is_some() {
             self.process_exit_mode();
-            return;
+            return true;
         }
         let Some(ed) = &self.editor else {
-            return;
+            return changed;
         };
         if !ed.dirty || self.conflict {
-            return;
+            return changed;
         }
         if self.last_edit.elapsed() >= Duration::from_secs(2)
             && self.last_local_save.elapsed() >= Duration::from_secs(2)
         {
             self.save_local_now();
+            changed = true;
         }
         if self.remote_path.is_some()
             && self.last_edit.elapsed() >= Duration::from_secs(8)
@@ -1890,7 +1910,9 @@ impl App {
             && !self.net_busy
         {
             self.save_remote_now();
+            changed = true;
         }
+        changed
     }
 
     fn save_local_now(&mut self) -> bool {
@@ -3477,12 +3499,14 @@ impl App {
         }
     }
 
-    fn drain_ai(&mut self) {
+    fn drain_ai(&mut self) -> bool {
+        let mut changed = false;
         loop {
             let event = match self.ai_rx.try_recv() {
                 Ok(event) => event,
                 Err(_) => break,
             };
+            changed = true;
             match event {
                 AiEvent::Progress {
                     job_id,
@@ -3586,6 +3610,7 @@ impl App {
                 }
             }
         }
+        changed
     }
 
     fn reveal_ai_selection(&mut self) {
