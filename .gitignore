@@ -1,0 +1,6 @@
+/target
+/existing/
+.env
+credentials.toml
+ai.toml
+*.log

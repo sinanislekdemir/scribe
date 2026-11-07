@@ -1,0 +1,28 @@
+[package]
+name = "scribe"
+version = "0.1.0"
+edition = "2024"
+authors = ["Sinan Islekdemir <sinan@islekdemir.com>"]
+description = "A focused terminal editor for long-form prose stored as ODT in Nextcloud"
+license = "MIT"
+repository = "https://github.com/sinanislekdemir/scribe"
+readme = "README.md"
+keywords = ["odt", "tui", "editor", "writing", "nextcloud"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+crossterm = "0.29.0"
+dirs = "7.0.0"
+percent-encoding = "2.3.2"
+ratatui = "0.30.2"
+roxmltree = "0.21.2"
+rpassword = "7.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tempfile = "3.27.0"
+toml = "1.2.0"
+unicode-width = "0.2.3"
+ureq = "2.12"
+zip = { version = "9.4.0", default-features = false, features = ["deflate"] }
