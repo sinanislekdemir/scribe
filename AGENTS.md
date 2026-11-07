@@ -27,6 +27,7 @@ src/main.rs       CLI, login wizard, terminal setup
 src/app.rs        TUI state, event loop, rendering, autosave, conflict handling
 src/editor.rs     document cursor, editing, wrapping, pagination, undo, smart quotes
 src/ai.rs         AI writing check: config, OpenAI-compatible client, prompt
+build.rs          embeds the git tag / version into the binary
 src/model.rs      Book / Chapter / Para / styled characters, counts
 src/odt/mod.rs    ODT read/write, style resolution, unsupported-content refusal
 src/nextcloud.rs  WebDAV client and Nextcloud Login Flow v2
@@ -72,7 +73,7 @@ scribe roundtrip in.odt out.odt
 - `Ctrl+L` requests a full terminal clear + redraw. External processes writing to the TTY can corrupt ratatui’s diff and persist garbage; `Ctrl+L` is the recovery path.
 - Browser launches during login must detach stdio to `/dev/null` and not wait. Firefox/Glean logs inheriting the TTY will corrupt the TUI.
 - Help is `Alt+H`; `F1` is kept only as a fallback. Do **not** bind `Ctrl+H` — terminals send it as Backspace. Word deletion is `Ctrl+W`, not `Ctrl+Backspace`. `F9` is reserved for the menu bar. `F8` is reserved for the AI writing check. `Alt+A` opens About (also `Help → About scribe`).
-- The About overlay shows `CARGO_PKG_VERSION`, `CARGO_PKG_AUTHORS` (name + email), `CARGO_PKG_REPOSITORY`, and `CARGO_PKG_LICENSE`. Keep personal infrastructure details (Nextcloud domain, SSH hosts, IPs) out of it.
+- The About overlay shows the version, `CARGO_PKG_AUTHORS` (name + email), `CARGO_PKG_REPOSITORY`, and `CARGO_PKG_LICENSE`. The version comes from `SCRIBE_VERSION`, set by `build.rs` from `git describe --tags --always --dirty` (or the `SCRIBE_VERSION` env var), with `CARGO_PKG_VERSION` as the fallback when git metadata is unavailable. Do not hardcode it. Keep personal infrastructure details (Nextcloud domain, SSH hosts, IPs) out of it.
 - Nextcloud is optional. `scribe open FILE.odt` and `scribe FILE.odt` must never require credentials. With no saved credentials, the no-argument first-run menu offers Nextcloud login, a local `.odt`, and quit; do not force Nextcloud login.
 - Italic is `Alt+I`; most terminals send `Ctrl+I` as Tab. Bold is `Ctrl+B` or `Alt+B`.
 - Smart quotes apply only to **typed** characters via `insert_typed_char`. `insert_text` (paste) must not convert quotes.

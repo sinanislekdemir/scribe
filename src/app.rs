@@ -41,10 +41,13 @@ const SELECTION_BG: Color = Color::Rgb(53, 68, 92);
 const AI_ISSUE_BG: Color = Color::Rgb(58, 48, 36);
 const AI_FOCUS_BG: Color = Color::Rgb(96, 72, 38);
 
-const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const APP_AUTHOR: &str = env!("CARGO_PKG_AUTHORS");
 const APP_REPO: &str = env!("CARGO_PKG_REPOSITORY");
 const APP_LICENSE: &str = env!("CARGO_PKG_LICENSE");
+
+fn app_version() -> &'static str {
+    option_env!("SCRIBE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
 
 #[derive(Clone, Debug)]
 enum SaveState {
@@ -3678,7 +3681,7 @@ impl App {
         frame.render_widget(block, rect);
         let lines = vec![
             Line::from(Span::styled(
-                format!("scribe {APP_VERSION}"),
+                format!("scribe {}", app_version()),
                 Style::default().fg(HEADING).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),

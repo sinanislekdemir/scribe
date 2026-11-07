@@ -34,6 +34,8 @@ The TUI is intentionally small: one chapter at a time, a centered 120-column tex
 
 ![About scribe](assets/scribe4.png)
 
+The version is embedded at build time from `git describe --tags --always --dirty` (or the `SCRIBE_VERSION` environment variable in CI). Tagged builds show the exact tag, for example `v0.1.0`; development builds show the nearest tag plus the commit.
+
 ## Build
 
 ```bash
@@ -345,7 +347,7 @@ git tag -a v0.1.1 -m "scribe v0.1.1"
 git push origin v0.1.1
 ```
 
-The release workflow checks that the tag matches `Cargo.toml`, builds static Linux x86_64/arm64 binaries plus a macOS universal binary, and publishes the tarballs with `SHA256SUMS` on the Releases page.
+The release workflow checks that the tag matches `Cargo.toml`, builds static Linux x86_64/arm64 binaries plus a macOS universal binary, and publishes the tarballs with `SHA256SUMS` on the Releases page. The same tag is embedded in the About page (`git describe` at build time).
 
 ## Development
 
