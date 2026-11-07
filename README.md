@@ -49,6 +49,14 @@ cargo install --path .
 
 No system libraries are required beyond the Rust toolchain. ODT reading/writing, WebDAV, and the TUI are all Rust dependencies.
 
+Prebuilt binaries are published on the [Releases](https://github.com/sinanislekdemir/scribe/releases) page:
+
+- **Linux x86_64** — static (musl), no glibc dependency
+- **Linux arm64** — static (musl), no glibc dependency
+- **macOS universal** — Intel and Apple Silicon in one binary
+
+Releases are built automatically from version tags such as `v0.1.0`.
+
 ## Local-only use
 
 No Nextcloud account is required to try the editor:
