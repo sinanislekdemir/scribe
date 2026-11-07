@@ -34,7 +34,7 @@ The TUI is intentionally small: one chapter at a time, a centered 120-column tex
 
 ![About scribe](assets/scribe4.png)
 
-The version is embedded at build time from `git describe --tags --always --dirty` (or the `SCRIBE_VERSION` environment variable in CI). Tagged builds show the exact tag, for example `v0.1.0`; development builds show the nearest tag plus the commit.
+The version is embedded at build time from `git describe --tags --always --dirty` (or the `SCRIBE_VERSION` environment variable in CI). Tagged builds show the exact tag, for example `v0.1.1`; development builds show the nearest tag plus the commit.
 
 ## Build
 
@@ -223,11 +223,14 @@ Panel keys:
 | Key | Action |
 |---|---|
 | `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` | Move between suggestions |
+| `←` / `→` | Scroll a long selected suggestion horizontally |
 | `Enter` / `A` | Apply the selected suggestion |
 | `D` / `X` / `Delete` | Dismiss the selected suggestion |
 | `R` | Run the check again |
 | `Esc` / `F8` | Close the panel |
 | `Ctrl+Z` / `Ctrl+Y` | Undo/redo and close the panel |
+
+Long suggestion rows scroll horizontally with `←`/`→` (a `…` marks the clipped edge); the selected suggestion's explanation wraps over the detail area.
 
 The check reports typos, wrong diacritics, duplicated words, agreement and
 punctuation errors, and genuinely broken sentences. It is deliberately
@@ -343,8 +346,8 @@ If the screen gets corrupted by another process writing to the same terminal (br
 Bump the version in `Cargo.toml`, commit it, then push a matching tag:
 
 ```bash
-git tag -a v0.1.1 -m "scribe v0.1.1"
-git push origin v0.1.1
+git tag -a v0.1.2 -m "scribe v0.1.2"
+git push origin v0.1.2
 ```
 
 The release workflow checks that the tag matches `Cargo.toml`, builds static Linux x86_64/arm64 binaries plus a macOS universal binary, and publishes the tarballs with `SHA256SUMS` on the Releases page. The same tag is embedded in the About page (`git describe` at build time).

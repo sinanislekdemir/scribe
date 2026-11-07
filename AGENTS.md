@@ -98,7 +98,7 @@ scribe roundtrip in.odt out.odt
 - Long chapters are split at paragraph boundaries (currently ~12k chars) and merged. Paragraph indices are global, so do not renumber per chunk.
 - Config is `~/.config/scribe/ai.toml`, mode `0600`, separate from Nextcloud credentials. `SCRIBE_AI_API_KEY` / `SCRIBE_AI_BASE_URL` / `SCRIBE_AI_MODEL` override it at runtime. Never commit or log the key or chapter text.
 - The panel is a bottom drawer above the status bar. The editor viewport must shrink by the panel height so pagination and cursor stay correct. Do not overlap the status bar.
-- The panel is modal while open. `Esc`/`F8` closes it, `R` re-checks, `D`/`X`/`Delete` dismisses, `Enter`/`A` applies. `Ctrl+Z`/`Ctrl+Y` undo/redo and close the panel.
+- The panel is modal while open. `Esc`/`F8` closes it, `R` re-checks, `D`/`X`/`Delete` dismisses, `Enter`/`A` applies. `↑`/`↓` moves between suggestions; `←`/`→` horizontally scrolls a long selected row (the detail message wraps). `Ctrl+Z`/`Ctrl+Y` undo/redo and close the panel.
 - Dismissing removes a suggestion from the current result set only; a fresh check may show it again.
 - AI failures (missing config, HTTP error, malformed JSON) are non-fatal and must never affect saving, locking, or the book model.
 

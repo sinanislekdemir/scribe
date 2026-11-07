@@ -11,7 +11,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthChar;
 
 use crate::ai;
@@ -521,6 +521,7 @@ struct AiPanel {
     progress_done: usize,
     progress_total: usize,
     model: String,
+    scroll: usize,
 }
 
 impl AiPanel {
@@ -534,6 +535,7 @@ impl AiPanel {
             progress_done: 0,
             progress_total,
             model,
+            scroll: 0,
         }
     }
 
@@ -547,6 +549,7 @@ impl AiPanel {
             progress_done: 0,
             progress_total: 0,
             model: String::new(),
+            scroll: 0,
         }
     }
 }
@@ -2354,6 +2357,7 @@ impl App {
                                 panel.status = AiStatus::Ready;
                                 panel.progress_done = panel.progress_total;
                                 panel.selected = 0;
+                                panel.scroll = 0;
                                 panel.issues = issues;
                                 panel.message = if count == 0 {
                                     "No issues found.".to_string()
@@ -2408,6 +2412,8 @@ impl App {
             KeyCode::Down => self.ai_move(1),
             KeyCode::PageUp => self.ai_move(-10),
             KeyCode::PageDown => self.ai_move(10),
+            KeyCode::Left => self.ai_scroll(-8),
+            KeyCode::Right => self.ai_scroll(8),
             KeyCode::Home => self.ai_select(0),
             KeyCode::End => {
                 let last = self
@@ -2442,8 +2448,28 @@ impl App {
                 return;
             }
             panel.selected = index.min(panel.issues.len() - 1);
+            panel.scroll = 0;
         }
         self.reveal_ai_selection();
+    }
+
+    fn ai_scroll(&mut self, delta: isize) {
+        let Some(panel) = &mut self.ai_panel else {
+            return;
+        };
+        if panel.status != AiStatus::Ready || panel.issues.is_empty() {
+            return;
+        }
+        let Some(issue) = panel.issues.get(panel.selected) else {
+            return;
+        };
+        let content = ai_issue_line(issue, panel.selected);
+        let width = crossterm::terminal::size()
+            .map(|(width, _)| width as usize)
+            .unwrap_or(120)
+            .saturating_sub(3);
+        let max_scroll = text_width(&content).saturating_sub(width);
+        panel.scroll = (panel.scroll as isize + delta).clamp(0, max_scroll as isize) as usize;
     }
 
     fn apply_selected_ai(&mut self) {
@@ -2488,6 +2514,7 @@ impl App {
                 });
                 ai::reanchor(&mut panel.issues, &paragraphs);
                 panel.selected = panel.selected.min(panel.issues.len().saturating_sub(1));
+                panel.scroll = 0;
                 panel.message = "Suggestion no longer matches the text.".to_string();
             }
             self.toast("Suggestion is stale; run the check again.");
@@ -2500,6 +2527,7 @@ impl App {
             panel.issues.remove(selected);
             ai::reanchor(&mut panel.issues, &paragraphs);
             panel.selected = panel.selected.min(panel.issues.len().saturating_sub(1));
+            panel.scroll = 0;
             panel.message = if panel.issues.is_empty() {
                 "All suggestions handled.".to_string()
             } else {
@@ -2519,6 +2547,7 @@ impl App {
         }
         panel.issues.remove(panel.selected);
         panel.selected = panel.selected.min(panel.issues.len().saturating_sub(1));
+        panel.scroll = 0;
         panel.message = if panel.issues.is_empty() {
             "No suggestions left.".to_string()
         } else {
@@ -3223,11 +3252,15 @@ impl App {
             return;
         }
         let footer_y = rect.y + rect.height - 1;
-        let detail_y = footer_y.saturating_sub(1);
+        let detail_rows = 2u16.min(rect.height.saturating_sub(3));
+        let detail_y = footer_y.saturating_sub(detail_rows);
         let footer = match panel.status {
             AiStatus::Checking => " Esc cancel · check again with R",
             AiStatus::Error => " R retry · Esc close",
-            AiStatus::Ready => " ↑↓ move · Enter apply · D dismiss · R re-check · Esc close",
+            AiStatus::Ready if rect.width >= 95 => {
+                " ↑↓ move · ←→ scroll · Enter apply · D dismiss · R re-check · Esc close"
+            }
+            AiStatus::Ready => " ↑↓ ←→ move/scroll · Enter apply · D dismiss · R recheck · Esc",
         };
         buf.set_stringn(
             rect.x,
@@ -3293,16 +3326,27 @@ impl App {
                 buf[(x, y)].set_char(' ');
                 buf[(x, y)].set_style(style);
             }
-            let marker = if selected { "▶" } else { " " };
-            let replacement = issue.replacement.as_deref().unwrap_or("(no auto-fix)");
-            let line = format!(
-                "{marker} {:>2}. {:<10} {}  →  {}",
-                index + 1,
-                issue.kind,
-                issue.original,
-                replacement
+            let prefix = if selected { "▶ " } else { "  " };
+            let content = ai_issue_line(issue, index);
+            let visible = if selected {
+                let max_scroll =
+                    text_width(&content).saturating_sub(rect.width.saturating_sub(3) as usize);
+                scroll_text(
+                    &content,
+                    panel.scroll.min(max_scroll),
+                    rect.width.saturating_sub(2) as usize,
+                )
+            } else {
+                content
+            };
+            buf.set_stringn(rect.x, y, prefix, 2, style);
+            buf.set_stringn(
+                rect.x + 2,
+                y,
+                &visible,
+                rect.width.saturating_sub(2) as usize,
+                style,
             );
-            buf.set_stringn(rect.x, y, &line, rect.width as usize, style);
         }
 
         let detail = panel
@@ -3316,13 +3360,20 @@ impl App {
                 }
             })
             .unwrap_or_else(|| panel.message.clone());
-        buf.set_stringn(
-            rect.x + 1,
-            detail_y,
-            &detail,
-            rect.width.saturating_sub(2) as usize,
-            Style::default().bg(PANEL_BG).fg(DIM),
-        );
+        if detail_rows > 0 {
+            let detail_area = Rect {
+                x: rect.x + 1,
+                y: detail_y,
+                width: rect.width.saturating_sub(2),
+                height: detail_rows,
+            };
+            frame.render_widget(
+                Paragraph::new(detail)
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().bg(PANEL_BG).fg(DIM)),
+                detail_area,
+            );
+        }
     }
 
     fn draw_menu_dropdown(&self, frame: &mut Frame, area: Rect) {
@@ -4374,6 +4425,57 @@ fn text_width(value: &str) -> usize {
         .sum()
 }
 
+fn ai_issue_line(issue: &ai::Issue, index: usize) -> String {
+    let replacement = issue.replacement.as_deref().unwrap_or("(no auto-fix)");
+    format!(
+        "{:>2}. {:<10} {}  →  {}",
+        index + 1,
+        issue.kind,
+        issue.original,
+        replacement
+    )
+}
+
+/// Show a horizontal window into `text`, using `…` at the clipped edges.
+fn scroll_text(text: &str, skip: usize, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = chars.len();
+    let mut col = 0usize;
+    for (index, ch) in chars.iter().enumerate() {
+        let width = UnicodeWidthChar::width(*ch).unwrap_or(0);
+        if col + width > skip {
+            start = index;
+            break;
+        }
+        col += width;
+    }
+
+    let mut out = String::new();
+    let mut used = 0usize;
+    if skip > 0 {
+        out.push('…');
+        used = 1;
+    }
+    let mut index = start;
+    while index < chars.len() {
+        let width = UnicodeWidthChar::width(chars[index]).unwrap_or(0);
+        let reserve = if index + 1 < chars.len() { 1 } else { 0 };
+        if used + width + reserve > max_width {
+            break;
+        }
+        out.push(chars[index]);
+        used += width;
+        index += 1;
+    }
+    if index < chars.len() && used < max_width {
+        out.push('…');
+    }
+    out
+}
+
 fn menu_dropdown_width(menu: &MenuDef) -> u16 {
     let mut max = 0;
     for entry in menu.entries {
@@ -4458,6 +4560,14 @@ mod tests {
     fn menu_navigation_stays_when_nothing_is_enabled() {
         let entries = [item(MenuAction::Undo), item(MenuAction::Redo)];
         assert_eq!(next_enabled_entry(&entries, 1, 1, |_| false), 1);
+    }
+
+    #[test]
+    fn scroll_text_clips_and_marks_edges() {
+        assert_eq!(scroll_text("0123456789", 0, 5), "0123…");
+        assert_eq!(scroll_text("0123456789", 5, 5), "…567…");
+        assert_eq!(scroll_text("0123456789", 5, 10), "…56789");
+        assert_eq!(scroll_text("abc", 0, 10), "abc");
     }
 
     #[test]
