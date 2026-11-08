@@ -6083,17 +6083,9 @@ fn notes_document_from(book: &Book) -> Result<OdtDocument> {
     } else {
         format!("{title} — Notes")
     };
-    let mut doc = OdtDocument::new(title)?;
-    doc.book.chapters = book
-        .chapters
-        .iter()
-        .map(|chapter| Chapter::new(chapter.number, chapter.title.clone()))
-        .collect();
-    if doc.book.chapters.is_empty() {
-        doc.book.chapters.push(Chapter::new(1, ""));
-    }
-    doc.book.renumber();
-    Ok(doc)
+    // Notes start blank: they are their own document and must not inherit the
+    // book's chapter structure.
+    OdtDocument::new(title)
 }
 
 fn parent_path(path: &str) -> String {
@@ -6430,23 +6422,16 @@ mod tests {
     }
 
     #[test]
-    fn notes_document_mirrors_chapters() {
+    fn notes_document_starts_blank() {
         let mut book = Book::new("My Book");
         book.chapters[0].title = "One".to_string();
         book.chapters.push(Chapter::new(2, "Two"));
         let notes = notes_document_from(&book).unwrap();
         assert_eq!(notes.book.title, "My Book — Notes");
-        assert_eq!(notes.book.chapters.len(), 2);
-        assert_eq!(notes.book.chapters[0].title, "One");
-        assert_eq!(notes.book.chapters[1].title, "Two");
-        assert!(
-            notes
-                .book
-                .chapters
-                .iter()
-                .all(|chapter| chapter.paragraphs.len() == 1
-                    && chapter.paragraphs[0].chars.is_empty())
-        );
+        assert_eq!(notes.book.chapters.len(), 1);
+        assert_eq!(notes.book.chapters[0].title, "");
+        assert_eq!(notes.book.chapters[0].paragraphs.len(), 1);
+        assert!(notes.book.chapters[0].paragraphs[0].chars.is_empty());
     }
 
     #[test]
