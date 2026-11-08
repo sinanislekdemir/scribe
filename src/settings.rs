@@ -9,11 +9,31 @@ use serde::{Deserialize, Serialize};
 use crate::config;
 use crate::theme::ThemeName;
 
+pub const DEFAULT_MAX_WIDTH: usize = 120;
+pub const MIN_MAX_WIDTH: usize = 40;
+pub const MAX_MAX_WIDTH: usize = 240;
+
+fn default_max_width() -> usize {
+    DEFAULT_MAX_WIDTH
+}
+
 /// UI preferences that are not secrets. Stored in `~/.config/scribe/settings.toml`.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub theme: ThemeName,
+    /// Maximum text column count. The terminal width can still make it narrower.
+    #[serde(default = "default_max_width")]
+    pub max_width: usize,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: ThemeName::default(),
+            max_width: DEFAULT_MAX_WIDTH,
+        }
+    }
 }
 
 pub fn path() -> Result<PathBuf> {
@@ -26,7 +46,8 @@ pub fn load() -> Result<Settings> {
         return Ok(Settings::default());
     }
     let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let settings: Settings = toml::from_str(&text).context("parse settings.toml")?;
+    let mut settings: Settings = toml::from_str(&text).context("parse settings.toml")?;
+    settings.max_width = settings.max_width.clamp(MIN_MAX_WIDTH, MAX_MAX_WIDTH);
     Ok(settings)
 }
 
@@ -54,19 +75,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_round_trip_keeps_theme() {
+    fn settings_round_trip_keeps_theme_and_width() {
         let settings = Settings {
             theme: ThemeName::Paper,
+            max_width: 88,
         };
         let text = toml::to_string_pretty(&settings).unwrap();
         assert!(text.contains("theme = \"paper\""));
+        assert!(text.contains("max_width = 88"));
         let parsed: Settings = toml::from_str(&text).unwrap();
         assert_eq!(parsed.theme, ThemeName::Paper);
+        assert_eq!(parsed.max_width, 88);
     }
 
     #[test]
-    fn missing_theme_defaults_to_monokai() {
+    fn missing_settings_use_defaults() {
         let parsed: Settings = toml::from_str("").unwrap();
         assert_eq!(parsed.theme, ThemeName::Monokai);
+        assert_eq!(parsed.max_width, DEFAULT_MAX_WIDTH);
+    }
+
+    #[test]
+    fn default_width_matches_the_editor_default() {
+        assert_eq!(DEFAULT_MAX_WIDTH, crate::editor::MAX_TEXT_WIDTH);
     }
 }

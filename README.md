@@ -212,13 +212,19 @@ Page counts are **terminal pages** at the current width/height, not printed ODT 
 
 ## Themes
 
-The interface ships with four themes, selectable in `Tools → Configuration…`
+The interface ships with ten themes, selectable in `Tools → Configuration…`
 (also `Ctrl+,` or `Alt+,`) under **Appearance**:
 
 - **Monokai** — dark, high-contrast classic (default)
 - **Nord** — cool blue-gray dark
 - **One Dark** — Atom-style dark
 - **Paper** — a warm, low-glare light theme that avoids pure white and pure black
+- **Gruvbox Dark** — warm, earthy dark
+- **Dracula** — purple-heavy dark
+- **Tokyo Night** — cool blue night
+- **Catppuccin** — soft pastel dark
+- **Solarized Dark** — blue-green dark with Solarized accents
+- **Solarized Light** — the matching low-glare light theme
 
 The choice is saved to `~/.config/scribe/settings.toml` and restored on the next
 start. `←`/`→` previews a theme immediately; `s` saves it, `Esc` reverts.

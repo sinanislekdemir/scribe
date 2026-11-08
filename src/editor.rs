@@ -43,6 +43,27 @@ pub enum MarkResult {
     Cancelled,
 }
 
+/// Text copied inside scribe. Each inner vector is one paragraph, so pasting
+/// keeps paragraph breaks and the original character styles. This never touches
+/// the system clipboard.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClipText {
+    paragraphs: Vec<Vec<StyledChar>>,
+}
+
+impl ClipText {
+    pub fn char_count(&self) -> usize {
+        self.paragraphs
+            .iter()
+            .map(|chars| chars.iter().filter(|c| c.ch != '\n').count())
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paragraphs.is_empty()
+    }
+}
+
 #[derive(Clone)]
 struct Snapshot {
     book: Book,
@@ -64,6 +85,9 @@ pub struct Editor {
     /// snapshot.
     typing_undo: Option<Cursor>,
     text_width: usize,
+    max_text_width: usize,
+    term_width: u16,
+    term_height: u16,
     page_height: usize,
     lines: Vec<VisualLine>,
     chapter_pages: Vec<usize>,
@@ -88,6 +112,9 @@ impl Editor {
             redo: Vec::new(),
             typing_undo: None,
             text_width: 1,
+            max_text_width: MAX_TEXT_WIDTH,
+            term_width,
+            term_height,
             page_height: 1,
             lines: Vec::new(),
             chapter_pages: Vec::new(),
@@ -110,9 +137,22 @@ impl Editor {
         self.page_height
     }
 
+    /// Change the maximum prose width in columns. The terminal width still wins
+    /// when it is narrower, and the document is re-wrapped immediately.
+    pub fn set_max_width(&mut self, max_width: usize) {
+        let max_width = max_width.max(1);
+        if max_width == self.max_text_width {
+            return;
+        }
+        self.max_text_width = max_width;
+        self.set_viewport(self.term_width, self.term_height);
+    }
+
     pub fn set_viewport(&mut self, term_width: u16, term_height: u16) {
+        self.term_width = term_width;
+        self.term_height = term_height;
         let w = term_width as usize;
-        let text = w.saturating_sub(4).clamp(1, MAX_TEXT_WIDTH);
+        let text = w.saturating_sub(4).clamp(1, self.max_text_width);
         let ph = (term_height as usize).saturating_sub(1).max(1);
         if text == self.text_width && ph == self.page_height {
             return;
@@ -607,6 +647,71 @@ impl Editor {
         self.clear_pending();
         self.remove_range(start, end);
         self.clear_selection();
+        self.mark_dirty();
+        self.rebuild_current_pages();
+        true
+    }
+
+    /// Copy the marked range into an internal clipboard. This does not change
+    /// the document or the selection.
+    pub fn copy_selection(&self) -> Option<ClipText> {
+        let (start, end) = self.selection_bounds()?;
+        let chapter = self.doc.book.chapters.get(start.chapter)?;
+        let mut paragraphs = Vec::new();
+        for para in start.para..=end.para {
+            let Some(p) = chapter.paragraphs.get(para) else {
+                break;
+            };
+            let from = if para == start.para {
+                start.offset.min(p.len())
+            } else {
+                0
+            };
+            let to = if para == end.para {
+                end.offset.min(p.len())
+            } else {
+                p.len()
+            };
+            paragraphs.push(p.chars[from..to.max(from)].to_vec());
+        }
+        if paragraphs.is_empty() {
+            return None;
+        }
+        Some(ClipText { paragraphs })
+    }
+
+    /// Copy the marked range and remove it from the document in one undo step.
+    pub fn cut_selection(&mut self) -> Option<ClipText> {
+        let clip = self.copy_selection()?;
+        if !self.delete_selection() {
+            return None;
+        }
+        Some(clip)
+    }
+
+    /// Insert an internal clipboard at the cursor. An active selection is
+    /// replaced, paragraph breaks become new paragraphs, and character styles
+    /// are preserved.
+    pub fn paste_clip(&mut self, clip: &ClipText) -> bool {
+        if clip.is_empty() {
+            return false;
+        }
+        self.begin_edit();
+        for (index, chars) in clip.paragraphs.iter().enumerate() {
+            if index > 0 {
+                let at = self.cursor.offset;
+                let rest = self.para_mut().split_off(at);
+                let idx = self.cursor.para + 1;
+                self.doc.book.chapters[self.cursor.chapter]
+                    .paragraphs
+                    .insert(idx, rest);
+                self.cursor.para = idx;
+                self.cursor.offset = 0;
+            }
+            let at = self.cursor.offset.min(self.para().len());
+            self.para_mut().chars.splice(at..at, chars.iter().copied());
+            self.cursor.offset = at + chars.len();
+        }
         self.mark_dirty();
         self.rebuild_current_pages();
         true
@@ -1757,6 +1862,113 @@ mod tests {
         ed.toggle_mark();
         assert_eq!(ed.selection_word_count(), 0);
         assert_eq!(ed.selection_len(), 1);
+    }
+
+    #[test]
+    fn copy_and_paste_keep_text_and_styles() {
+        let doc = OdtDocument::new("Test").unwrap();
+        let mut ed = Editor::new(doc, 80, 24);
+        for ch in "Hello world".chars() {
+            ed.insert_char(ch);
+        }
+        ed.cursor.offset = 6;
+        ed.toggle_mark();
+        ed.cursor.offset = 11;
+        ed.toggle_mark();
+        ed.toggle_bold();
+        ed.cursor.offset = 0;
+        ed.toggle_mark();
+        ed.cursor.offset = 5;
+        ed.toggle_mark();
+        let clip = ed.copy_selection().unwrap();
+        assert_eq!(clip.char_count(), 5);
+        assert!(ed.has_selection());
+        assert_eq!(ed.doc.book.chapters[0].paragraphs[0].text(), "Hello world");
+
+        ed.clear_selection();
+        ed.cursor.offset = 11;
+        assert!(ed.paste_clip(&clip));
+        let chars = &ed.doc.book.chapters[0].paragraphs[0].chars;
+        assert_eq!(
+            ed.doc.book.chapters[0].paragraphs[0].text(),
+            "Hello worldHello"
+        );
+        assert!(chars[11..16].iter().all(|c| !c.bold));
+    }
+
+    #[test]
+    fn cut_and_paste_across_paragraphs() {
+        let doc = OdtDocument::new("Test").unwrap();
+        let mut ed = Editor::new(doc, 80, 24);
+        for ch in "Hello".chars() {
+            ed.insert_char(ch);
+        }
+        ed.newline();
+        for ch in "world".chars() {
+            ed.insert_char(ch);
+        }
+        ed.cursor.para = 0;
+        ed.cursor.offset = 2;
+        ed.toggle_mark();
+        ed.cursor.para = 1;
+        ed.cursor.offset = 3;
+        ed.toggle_mark();
+        let clip = ed.cut_selection().unwrap();
+        assert_eq!(clip.char_count(), 6);
+        let chapter = &ed.doc.book.chapters[0];
+        assert_eq!(chapter.paragraphs.len(), 1);
+        assert_eq!(chapter.paragraphs[0].text(), "Held");
+
+        ed.cursor.offset = 4;
+        assert!(ed.paste_clip(&clip));
+        let chapter = &ed.doc.book.chapters[0];
+        assert_eq!(chapter.paragraphs.len(), 2);
+        assert_eq!(chapter.paragraphs[0].text(), "Heldllo");
+        assert_eq!(chapter.paragraphs[1].text(), "wor");
+
+        ed.undo();
+        let chapter = &ed.doc.book.chapters[0];
+        assert_eq!(chapter.paragraphs.len(), 1);
+        assert_eq!(chapter.paragraphs[0].text(), "Held");
+    }
+
+    #[test]
+    fn paste_replaces_the_selection() {
+        let doc = OdtDocument::new("Test").unwrap();
+        let mut ed = Editor::new(doc, 80, 24);
+        for ch in "abcdef".chars() {
+            ed.insert_char(ch);
+        }
+        ed.cursor.offset = 0;
+        ed.toggle_mark();
+        ed.cursor.offset = 3;
+        ed.toggle_mark();
+        let clip = ed.copy_selection().unwrap();
+        ed.clear_selection();
+        ed.cursor.offset = 3;
+        ed.toggle_mark();
+        ed.cursor.offset = 6;
+        ed.toggle_mark();
+        assert!(ed.paste_clip(&clip));
+        assert_eq!(ed.doc.book.chapters[0].paragraphs[0].text(), "abcabc");
+        assert!(!ed.has_selection());
+    }
+
+    #[test]
+    fn max_width_limits_text_columns() {
+        let doc = OdtDocument::new("Test").unwrap();
+        let mut ed = Editor::new(doc, 200, 24);
+        assert_eq!(ed.text_width(), MAX_TEXT_WIDTH);
+        ed.set_max_width(80);
+        assert_eq!(ed.text_width(), 80);
+        ed.set_max_width(300);
+        assert_eq!(ed.text_width(), 196);
+        ed.set_viewport(100, 24);
+        assert_eq!(ed.text_width(), 96);
+        ed.set_max_width(80);
+        assert_eq!(ed.text_width(), 80);
+        ed.set_viewport(60, 24);
+        assert_eq!(ed.text_width(), 56);
     }
 
     #[test]

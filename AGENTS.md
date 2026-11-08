@@ -65,8 +65,9 @@ scribe roundtrip in.odt out.odt
 
 ### Editor / TUI
 
-- Mark/selection only. `Ctrl+Space` sets the mark at the cursor; moving extends the live selection; `Ctrl+Space` again finalizes it and opens the Selection popup (Bold/Italic/Underline/Strikethrough/Delete/None). `Esc` in the popup keeps the selection and closes it. After finalizing, a cursor move clears the selection and moves normally. `Delete`/`Backspace` removes the selection, typing replaces it, and inline style actions apply to it. Selection is limited to the current chapter (switching chapters clears it). No cut/copy/search. Paste works via bracketed paste, and pasting replaces an active selection.
-- Text width: `min(120, terminal_width - 4)`. Page height: `terminal_height - 2` (one row menu bar + one row status).
+- Mark/selection only. `Ctrl+Space` sets the mark at the cursor; moving extends the live selection; `Ctrl+Space` again finalizes it and opens the Selection popup (Cut/Copy/Paste/Bold/Italic/Underline/Strikethrough/Delete/None). `Esc` in the popup keeps the selection and closes it. After finalizing, a cursor move clears the selection and moves normally. `Delete`/`Backspace` removes the selection, typing replaces it, and inline style actions apply to it. Selection is limited to the current chapter (switching chapters clears it).
+- Clipboard is **app-internal only**; never use the system clipboard. `Ctrl+X`/`Ctrl+C`/`Ctrl+V` (also Edit menu and the Selection popup) cut, copy, and paste an in-memory `ClipText`. Copy keeps the selection. Cut deletes it in one undo step. Paste replaces an active selection and preserves character styles and paragraph breaks. Terminal bracketed paste still inserts plain text via `insert_text`.
+- Text width: `min(settings.max_width, terminal_width - 4)`. `max_width` defaults to 120 and is adjustable in `Tools → Configuration` (40–240 columns); it lives in `settings.toml` and is applied live and on `Esc`-cancel restored. Page height: `terminal_height - 2` (one row menu bar + one row status).
 - Viewport scrolling uses 75% steps with a 25% overlap (`scrolled_view_start`). Logical page counts still use full page-height blocks; `page_start` is the viewport top, not `page * page_height`.
 - The top menu bar is always visible. `F9` focuses it and opens the first menu; `←`/`→` switch menus, `↑`/`↓` move between enabled items, `Enter` runs, and `Esc`/`F9` closes. Menu actions must call the same `action_*` methods as the shortcuts; never duplicate command logic in the menu path.
 - Notes sidecar: `F7` (or `Tools → Notes`) toggles a second in-memory document session. The path is `<document>.notes.odt` (append the suffix; do not replace the original extension). A missing notes file is created automatically as a blank document; do not mirror the book's chapters or seed section headings. Park both `Editor` instances in `DocMemory` so cursor/undo state survives switching; flush the outgoing document before swapping. Notes must not update `last_file` in `credentials.toml` and do not acquire their own lock.
@@ -91,7 +92,7 @@ scribe roundtrip in.odt out.odt
 - Bold/italic toggles the word under the cursor, or sets pending style for the next text. `B*` / `I*` in the status bar means pending.
 - Status bar totals include the book title, chapter titles, and body. Page counts are **terminal pages**, not printed ODT pages.
 - The status bar shows the local **date and time** (`YYYY-MM-DD HH:MM`) right-aligned when it fits beside the left content; if only one fits, show the **time alone** (`HH:MM`). Below 30 columns it stays clock-free. Reserve the right columns so the clock never overlaps the left side, and redraw only when the minute changes (do not add a per-second clock tick).
-- Colors come from `src/theme.rs` palettes (Monokai, Nord, One Dark, Paper). Rendering code must use `self.palette` roles rather than hardcoded colors. New color roles must be added to every theme.
+- Colors come from `src/theme.rs` palettes (Monokai, Nord, One Dark, Paper, Gruvbox Dark, Dracula, Tokyo Night, Catppuccin, Solarized Dark, Solarized Light). Rendering code must use `self.palette` roles rather than hardcoded colors. New color roles must be added to every theme. Theme tests require distinct surface colors and readable light/dark contrast; light themes are not limited to Paper.
 
 ### AI writing check
 
@@ -200,7 +201,7 @@ Check that the menu bar occupies the first row, the dropdown overlaps the editor
 
 - No DOCX support.
 - No manual page break inside a chapter.
-- No search/replace, cut/copy, or multi-cursor. Selection exists only as a mark range; there is no clipboard integration.
+- No search/replace or multi-cursor. Selection exists only as a mark range. Clipboard integration is app-internal only; there is no system clipboard support.
 - No automatic restore command for backups.
 - Support is strict: ODT structure/unsupported elements are refused rather than guessed.
 - Formatting is normalized to H1/H2/H3/body plus bold/italic/underline/strikethrough, paragraph alignment, and soft line breaks. Other inline formatting is dropped; unsupported blocks are refused.

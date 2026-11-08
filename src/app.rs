@@ -19,7 +19,7 @@ use crate::ai;
 use crate::backups;
 use crate::config::{self, Config};
 use crate::editor::{
-    Cursor, Editor, LineKind, MarkResult, smart_quote_for, smart_single_quote_for,
+    ClipText, Cursor, Editor, LineKind, MarkResult, smart_quote_for, smart_single_quote_for,
 };
 use crate::lock::{self, HeldLock, Identity, Kicker, LockEvent, LockHandle, LockInfo};
 use crate::model::{Align, Book, Chapter, ParaKind};
@@ -289,6 +289,9 @@ enum MenuAction {
     Undo,
     Redo,
     Find,
+    Cut,
+    Copy,
+    Paste,
     MarkSelection,
     SelectionActions,
     Bold,
@@ -375,6 +378,23 @@ const MENUS: &[MenuDef] = &[
                 shortcut: "F3",
                 action: MenuAction::Find,
             },
+            MenuEntry::Separator,
+            MenuEntry::Item {
+                label: "Cut",
+                shortcut: "Ctrl+X",
+                action: MenuAction::Cut,
+            },
+            MenuEntry::Item {
+                label: "Copy",
+                shortcut: "Ctrl+C",
+                action: MenuAction::Copy,
+            },
+            MenuEntry::Item {
+                label: "Paste",
+                shortcut: "Ctrl+V",
+                action: MenuAction::Paste,
+            },
+            MenuEntry::Separator,
             MenuEntry::Item {
                 label: "Mark selection",
                 shortcut: "Ctrl+Space",
@@ -531,6 +551,9 @@ struct MenuState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SelectionAction {
+    Cut,
+    Copy,
+    Paste,
     Bold,
     Italic,
     Underline,
@@ -539,7 +562,10 @@ enum SelectionAction {
     None,
 }
 
-const SELECTION_ACTIONS: [(&str, SelectionAction); 6] = [
+const SELECTION_ACTIONS: [(&str, SelectionAction); 9] = [
+    ("Cut", SelectionAction::Cut),
+    ("Copy", SelectionAction::Copy),
+    ("Paste", SelectionAction::Paste),
     ("Bold", SelectionAction::Bold),
     ("Italic", SelectionAction::Italic),
     ("Underline", SelectionAction::Underline),
@@ -682,9 +708,10 @@ enum ConfigField {
     JsonMode,
     Timeout,
     Theme,
+    MaxWidth,
 }
 
-const CONFIG_FIELDS: [ConfigField; 7] = [
+const CONFIG_FIELDS: [ConfigField; 8] = [
     ConfigField::BaseUrl,
     ConfigField::Model,
     ConfigField::ApiKey,
@@ -692,6 +719,7 @@ const CONFIG_FIELDS: [ConfigField; 7] = [
     ConfigField::JsonMode,
     ConfigField::Timeout,
     ConfigField::Theme,
+    ConfigField::MaxWidth,
 ];
 
 impl ConfigField {
@@ -704,6 +732,7 @@ impl ConfigField {
             ConfigField::JsonMode => "JSON mode",
             ConfigField::Timeout => "Timeout",
             ConfigField::Theme => "Theme",
+            ConfigField::MaxWidth => "Max width",
         }
     }
 
@@ -722,6 +751,7 @@ impl ConfigField {
 struct ConfigPanel {
     ai: ai::AiConfig,
     original_theme: ThemeName,
+    original_max_width: usize,
     selected: usize,
     editing: Option<Input>,
     status: Option<(String, bool)>,
@@ -729,10 +759,11 @@ struct ConfigPanel {
 }
 
 impl ConfigPanel {
-    fn new(ai: ai::AiConfig, theme: ThemeName) -> Self {
+    fn new(ai: ai::AiConfig, theme: ThemeName, max_width: usize) -> Self {
         Self {
             ai,
             original_theme: theme,
+            original_max_width: max_width,
             selected: 0,
             editing: None,
             status: None,
@@ -774,7 +805,7 @@ impl ConfigPanel {
                 }
             }
             ConfigField::Timeout => format!("{} s", self.ai.timeout_seconds),
-            ConfigField::Theme => String::new(),
+            ConfigField::Theme | ConfigField::MaxWidth => String::new(),
         }
     }
 
@@ -810,7 +841,7 @@ impl ConfigPanel {
                 Ok(seconds) => self.ai.timeout_seconds = seconds.max(5),
                 Err(_) => self.status = Some(("Timeout must be a number".to_string(), true)),
             },
-            ConfigField::JsonMode | ConfigField::Theme => {}
+            ConfigField::JsonMode | ConfigField::Theme | ConfigField::MaxWidth => {}
         }
     }
 
@@ -884,6 +915,7 @@ pub struct App {
     palette: Palette,
     config_panel: Option<ConfigPanel>,
     selection_menu: Option<SelectionMenu>,
+    clipboard: Option<ClipText>,
     notes_active: bool,
     notes_loading: bool,
     notes_main: Option<DocMemory>,
@@ -956,6 +988,7 @@ impl App {
             palette,
             config_panel: None,
             selection_menu: None,
+            clipboard: None,
             notes_active: false,
             notes_loading: false,
             notes_main: None,
@@ -1022,6 +1055,7 @@ impl App {
             palette,
             config_panel: None,
             selection_menu: None,
+            clipboard: None,
             notes_active: false,
             notes_loading: false,
             notes_main: None,
@@ -1114,7 +1148,8 @@ impl App {
         create_new: bool,
     ) {
         let (w, h) = crossterm::terminal::size().unwrap_or((100, 40));
-        let ed = Editor::new(doc, w, h);
+        let mut ed = Editor::new(doc, w, h);
+        ed.set_max_width(self.settings.max_width);
         self.local_path = local_path;
         self.remote_path = remote_path;
         self.pending_open = None;
@@ -2318,6 +2353,18 @@ impl App {
             self.action_redo();
             return;
         }
+        if key.code == KeyCode::Char('x') && ctrl(&key) {
+            self.action_cut();
+            return;
+        }
+        if key.code == KeyCode::Char('c') && ctrl(&key) {
+            self.action_copy();
+            return;
+        }
+        if key.code == KeyCode::Char('v') && ctrl(&key) {
+            self.action_paste();
+            return;
+        }
         if key.code == KeyCode::Char('b') && (ctrl(&key) || alt_only(&key)) {
             self.action_bold();
             return;
@@ -2408,7 +2455,9 @@ impl App {
             MenuAction::AiCheck => self.editor.is_some(),
             MenuAction::Notes => self.editor.is_some() && !self.notes_loading,
             MenuAction::DownloadCopy => self.remote_path.is_some() && self.editor.is_some(),
-            MenuAction::SelectionActions
+            MenuAction::Cut
+            | MenuAction::Copy
+            | MenuAction::SelectionActions
             | MenuAction::Bold
             | MenuAction::Italic
             | MenuAction::Underline
@@ -2416,6 +2465,9 @@ impl App {
                 .editor
                 .as_ref()
                 .is_some_and(|editor| editor.has_selection()),
+            MenuAction::Paste => {
+                self.editor.is_some() && self.clipboard.as_ref().is_some_and(|c| !c.is_empty())
+            }
             MenuAction::Subheading
             | MenuAction::AlignLeft
             | MenuAction::AlignCenter
@@ -2498,6 +2550,9 @@ impl App {
             MenuAction::Undo => self.action_undo(),
             MenuAction::Redo => self.action_redo(),
             MenuAction::Find => self.start_search(),
+            MenuAction::Cut => self.action_cut(),
+            MenuAction::Copy => self.action_copy(),
+            MenuAction::Paste => self.action_paste(),
             MenuAction::MarkSelection => self.action_mark(),
             MenuAction::SelectionActions => self.action_selection_actions(),
             MenuAction::Bold => self.action_bold(),
@@ -2973,6 +3028,46 @@ impl App {
         }
     }
 
+    fn action_copy(&mut self) {
+        let clip = self.editor.as_ref().and_then(Editor::copy_selection);
+        let Some(clip) = clip else {
+            self.toast("Mark a range first.");
+            return;
+        };
+        let chars = clip.char_count();
+        self.clipboard = Some(clip);
+        self.toast(format!("Copied {chars} chars."));
+    }
+
+    fn action_cut(&mut self) {
+        let clip = self.editor.as_mut().and_then(Editor::cut_selection);
+        let Some(clip) = clip else {
+            self.toast("Mark a range first.");
+            return;
+        };
+        let chars = clip.char_count();
+        self.clipboard = Some(clip);
+        self.last_edit = Instant::now();
+        self.save_state = SaveState::Idle;
+        self.toast(format!("Cut {chars} chars."));
+    }
+
+    fn action_paste(&mut self) {
+        let Some(clip) = self.clipboard.clone() else {
+            self.toast("Internal clipboard is empty.");
+            return;
+        };
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        let changed = editor.paste_clip(&clip);
+        if changed {
+            self.last_edit = Instant::now();
+            self.save_state = SaveState::Idle;
+            self.toast(format!("Pasted {} chars.", clip.char_count()));
+        }
+    }
+
     fn action_redraw(&mut self) {
         self.redraw_requested = true;
         self.toast("Screen redrawn.");
@@ -3172,6 +3267,7 @@ impl App {
     fn restore_doc_memory(&mut self, doc: DocMemory) {
         let (width, height) = crossterm::terminal::size().unwrap_or((100, 40));
         let mut editor = doc.editor;
+        editor.set_max_width(self.settings.max_width);
         editor.set_viewport(width, height);
         editor.sync_page();
         self.editor = Some(editor);
@@ -3263,7 +3359,7 @@ impl App {
                 ai::AiConfig::default()
             }
         };
-        let mut panel = ConfigPanel::new(ai, self.settings.theme);
+        let mut panel = ConfigPanel::new(ai, self.settings.theme, self.settings.max_width);
         panel.status = status;
         self.config_panel = Some(panel);
         self.overlay = Overlay::Config;
@@ -3272,6 +3368,7 @@ impl App {
     fn cancel_config(&mut self) {
         if let Some(panel) = self.config_panel.take() {
             self.set_theme(panel.original_theme);
+            self.set_max_width(panel.original_max_width);
         }
         if self.overlay == Overlay::Config {
             self.overlay = Overlay::None;
@@ -3281,6 +3378,33 @@ impl App {
     fn set_theme(&mut self, theme: ThemeName) {
         self.settings.theme = theme;
         self.palette = theme.palette();
+    }
+
+    fn set_max_width(&mut self, max_width: usize) {
+        self.settings.max_width = max_width.clamp(settings::MIN_MAX_WIDTH, settings::MAX_MAX_WIDTH);
+        self.apply_max_width();
+    }
+
+    fn apply_max_width(&mut self) {
+        let max_width = self.settings.max_width;
+        if let Some(editor) = &mut self.editor {
+            editor.set_max_width(max_width);
+        }
+        if let Some(memory) = &mut self.notes_main {
+            memory.editor.set_max_width(max_width);
+        }
+        if let Some(memory) = &mut self.notes_doc {
+            memory.editor.set_max_width(max_width);
+        }
+    }
+
+    fn adjust_max_width(&mut self, delta: isize) {
+        let current = self.settings.max_width as isize;
+        let next = (current + delta).clamp(
+            settings::MIN_MAX_WIDTH as isize,
+            settings::MAX_MAX_WIDTH as isize,
+        ) as usize;
+        self.set_max_width(next);
     }
 
     fn save_config(&mut self) {
@@ -3396,6 +3520,8 @@ impl App {
                 let theme = self.settings.theme.next();
                 self.set_theme(theme);
             }
+            KeyCode::Left if field == ConfigField::MaxWidth => self.adjust_max_width(-5),
+            KeyCode::Right if field == ConfigField::MaxWidth => self.adjust_max_width(5),
             KeyCode::Enter => match field {
                 ConfigField::JsonMode => {
                     if let Some(panel) = &mut self.config_panel {
@@ -3406,6 +3532,7 @@ impl App {
                     let theme = self.settings.theme.next();
                     self.set_theme(theme);
                 }
+                ConfigField::MaxWidth => self.adjust_max_width(5),
                 _ => {
                     if let Some(panel) = &mut self.config_panel {
                         panel.start_edit();
@@ -3421,6 +3548,7 @@ impl App {
                 let theme = self.settings.theme.next();
                 self.set_theme(theme);
             }
+            KeyCode::Char(' ') if field == ConfigField::MaxWidth => self.adjust_max_width(5),
             KeyCode::Delete if field == ConfigField::ApiKey => {
                 if let Some(panel) = &mut self.config_panel {
                     panel.ai.api_key.clear();
@@ -3663,6 +3791,15 @@ impl App {
             KeyCode::Enter | KeyCode::Char(' ') => {
                 self.run_selection_action(SELECTION_ACTIONS[menu.selected].1);
             }
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                self.run_selection_action(SelectionAction::Cut);
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                self.run_selection_action(SelectionAction::Copy);
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                self.run_selection_action(SelectionAction::Paste);
+            }
             KeyCode::Char('b') | KeyCode::Char('B') => {
                 self.run_selection_action(SelectionAction::Bold);
             }
@@ -3686,6 +3823,9 @@ impl App {
         self.selection_menu = None;
         self.overlay = Overlay::None;
         match action {
+            SelectionAction::Cut => self.action_cut(),
+            SelectionAction::Copy => self.action_copy(),
+            SelectionAction::Paste => self.action_paste(),
             SelectionAction::Bold => self.action_bold(),
             SelectionAction::Italic => self.action_italic(),
             SelectionAction::Underline => self.action_underline(),
@@ -4800,9 +4940,15 @@ impl App {
             );
             y += 1;
         }
-        let theme_index = CONFIG_FIELDS.len() - 1;
-        if y < field_bottom {
-            let selected = panel.selected == theme_index;
+        for field in [ConfigField::Theme, ConfigField::MaxWidth] {
+            if y >= field_bottom {
+                break;
+            }
+            let index = CONFIG_FIELDS
+                .iter()
+                .position(|candidate| *candidate == field)
+                .unwrap_or(0);
+            let selected = panel.selected == index;
             let row_style = if selected {
                 Style::default()
                     .bg(p.select_bg)
@@ -4818,18 +4964,33 @@ impl App {
             buf.set_stringn(
                 inner.x + 1,
                 y,
-                ConfigField::Theme.label(),
+                field.label(),
                 label_w as usize,
                 Style::default()
                     .bg(if selected { p.select_bg } else { p.panel_bg })
                     .fg(if selected { p.select_fg } else { p.dim }),
             );
-            let theme = if selected {
-                format!("◀ {} ▶", self.settings.theme.label())
-            } else {
-                self.settings.theme.label().to_string()
+            let value = match field {
+                ConfigField::Theme => {
+                    let label = self.settings.theme.label();
+                    if selected {
+                        format!("◀ {label} ▶")
+                    } else {
+                        label.to_string()
+                    }
+                }
+                ConfigField::MaxWidth => {
+                    let width = self.settings.max_width;
+                    if selected {
+                        format!("◀ {width} cols ▶")
+                    } else {
+                        format!("{width} cols")
+                    }
+                }
+                _ => String::new(),
             };
-            buf.set_stringn(value_x, y, &theme, value_w as usize, row_style);
+            buf.set_stringn(value_x, y, &value, value_w as usize, row_style);
+            y += 1;
         }
 
         if status_y < footer_y {
@@ -4862,7 +5023,7 @@ impl App {
             ("Testing the AI endpoint…", p.accent)
         } else {
             (
-                "↑↓ move · Enter edit/toggle · ←→ theme · s save · t test · Esc cancel",
+                "↑↓ move · Enter edit/toggle/adjust · ←→ theme/width · s save · t test · Esc cancel",
                 p.dim,
             )
         };
@@ -4929,6 +5090,9 @@ impl App {
             }
             buf.set_stringn(inner.x + 1, y, label, inner.width as usize, row_style);
             let hint = match action {
+                SelectionAction::Cut => "Ctrl+X",
+                SelectionAction::Copy => "Ctrl+C",
+                SelectionAction::Paste => "Ctrl+V",
                 SelectionAction::Bold => "B",
                 SelectionAction::Italic => "I",
                 SelectionAction::Underline => "U",
@@ -5529,14 +5693,14 @@ impl App {
             Line::from("Ctrl+Shift+K delete paragraph"),
             Line::from("Ctrl+Z undo                  Ctrl+Y redo"),
             Line::from("Ctrl+Space mark start/end    Esc clear selection"),
+            Line::from("Ctrl+X / C / V cut, copy, paste (internal clipboard)"),
             Line::from("Shift/Alt+Enter line break  Finish mark = selection menu"),
             Line::from(""),
             Line::from(Span::styled(
                 "Formatting",
                 Style::default().fg(p.heading).add_modifier(Modifier::BOLD),
             )),
-            Line::from("Ctrl+B / Alt+B bold word     Alt+I italic word"),
-            Line::from("Alt+U underline              Alt+S strikethrough"),
+            Line::from("Ctrl+B bold  Alt+I italic  Alt+U underline  Alt+S strike"),
             Line::from("B* / I* / U* / S* applies to the next typed text"),
             Line::from("H3 subheading and alignment are in the Edit menu"),
             Line::from("Typing \" or ' becomes curly based on surrounding text"),
@@ -6449,7 +6613,7 @@ mod tests {
             api_key: "sk-verysecretvalue123".to_string(),
             ..ai::AiConfig::default()
         };
-        let mut panel = ConfigPanel::new(cfg, ThemeName::Monokai);
+        let mut panel = ConfigPanel::new(cfg, ThemeName::Monokai, settings::DEFAULT_MAX_WIDTH);
         let shown = panel.display_key();
         assert!(!shown.contains("verysecretvalue"));
         assert!(shown.starts_with("sk-ve"));
