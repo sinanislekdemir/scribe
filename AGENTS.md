@@ -31,7 +31,7 @@ build.rs          embeds the git tag / version into the binary
 src/model.rs      Book / Chapter / Para / styled characters, counts
 src/odt/mod.rs    ODT read/write, style resolution, unsupported-content refusal
 src/nextcloud.rs  WebDAV client and Nextcloud Login Flow v2
-src/spell.rs      Hunspell-backed Turkish spelling check
+src/spell.rs      Hunspell-backed spelling check
 src/lock.rs       sidecar file locks, kick protocol, lock watcher
 src/backups.rs    backup ring under ~/.cache/scribe/backups
 src/config.rs     credentials/config paths
@@ -121,11 +121,12 @@ scribe roundtrip in.odt out.odt
 - The ask prompt in `src/ai.rs` is plain text and must not be turned into the JSON copy-editor prompt. It answers questions and must not rewrite prose unless explicitly asked.
 - While `ask_view` is active, editing keys, search, and the menu are disabled; only scrolling, `R`, `Esc`/`F6`, and the global redraw/help/config keys run. `F6` and `F4` are handled before the answer-view handler.
 
-### Turkish spelling check (Hunspell)
+### Spelling check (Hunspell)
 
-- `F5` (and `Tools → Check Turkish spelling…`) checks the **current chapter only** with the external `hunspell` binary. Do not check the whole book or switch the scope silently.
+- `F5` (and `Tools → Check spelling…`) checks the **current chapter only** with the external `hunspell` binary. Do not check the whole book or switch the scope silently.
 - This is spelling, not grammar. It does not handle `de/da`, `ki`, `mi`, agreement, or punctuation; do not present it as a grammar checker.
-- There is no Rust Hunspell dependency and no bundled dictionary. The binary and `tr_TR` dictionary are external. Config lives in `~/.config/scribe/hunspell.toml`; `SCRIBE_HUNSPELL_BINARY` / `SCRIBE_HUNSPELL_DICTIONARY` override it. Never download or execute an unpinned dictionary from the TUI.
+- There is no Rust Hunspell dependency and no bundled dictionary. The binary and dictionary are external. `settings.toml` `language` selects the dictionary (`tr_TR` by default). `~/.config/scribe/hunspell.toml` may set `binary`, an optional `dictionary` path override, `capitalized`, `skip_apostrophe_names`, and `ignore_file`. `SCRIBE_HUNSPELL_BINARY` / `SCRIBE_HUNSPELL_DICTIONARY` override both; dictionary precedence is env → `hunspell.toml` dictionary → `settings.toml` language. Never download or execute an unpinned dictionary from the TUI.
+- `settings.toml` `language` is editable as `Spell language` in `Ctrl+,` and is saved with the other UI settings. Empty values fall back to `tr_TR`. The language may be a dictionary stem or a full path; the path may start with `~/`.
 - Run the check on a worker thread and report through the existing `AiEvent::SpellDone` channel. Never block the event loop or add an async runtime.
 - The panel reuses `AiPanel` with `PanelKind::Spell`. Keep AI state and spell state separate: `ai_job` and `spell_job` are distinct, and starting one cancels the other. Do not let a late result overwrite the other panel.
 - Suggestions are inert until the user presses Enter/A. That path calls `Editor::replace_span` with the exact stored `original` and the selected alternative, pushes a normal undo snapshot, and keeps the surrounding bold/italic intact. Never edit automatically.

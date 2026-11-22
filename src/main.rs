@@ -308,7 +308,7 @@ fn print_help() {
            scribe ai-config --show  show the AI config (key masked)\n\
            scribe ai-config --test  test the AI endpoint\n\n\
          Only .odt files are supported.\n\
-         The Turkish spelling check (F5) uses the external hunspell binary\n\
-         and a tr_TR dictionary; see README for setup."
+         The spelling check (F5) uses the external hunspell binary and an\n\
+         installed dictionary; see README for setup."
     );
 }

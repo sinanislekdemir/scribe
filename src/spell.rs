@@ -32,7 +32,9 @@ pub enum CapitalizedMode {
 pub struct Config {
     #[serde(default = "default_binary")]
     pub binary: String,
-    #[serde(default = "default_dictionary")]
+    /// Optional Hunspell dictionary stem or path. Empty uses the `language`
+    /// value from `settings.toml`; the environment variable still wins.
+    #[serde(default)]
     pub dictionary: String,
     #[serde(default)]
     pub capitalized: CapitalizedMode,
@@ -48,10 +50,6 @@ fn default_binary() -> String {
     DEFAULT_BINARY.to_string()
 }
 
-fn default_dictionary() -> String {
-    DEFAULT_DICTIONARY.to_string()
-}
-
 fn default_true() -> bool {
     true
 }
@@ -60,7 +58,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             binary: default_binary(),
-            dictionary: default_dictionary(),
+            dictionary: String::new(),
             capitalized: CapitalizedMode::default(),
             skip_apostrophe_names: true,
             ignore_file: String::new(),
@@ -98,10 +96,14 @@ impl Config {
     }
 
     pub fn display_dictionary(&self) -> String {
-        Path::new(self.dictionary.trim())
+        let dictionary = self.dictionary.trim();
+        if dictionary.is_empty() {
+            return DEFAULT_DICTIONARY.to_string();
+        }
+        Path::new(dictionary)
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or(self.dictionary.trim())
+            .unwrap_or(dictionary)
             .to_string()
     }
 }
@@ -123,14 +125,29 @@ pub fn path() -> Result<PathBuf> {
     Ok(config::config_dir()?.join("hunspell.toml"))
 }
 
-pub fn load() -> Result<Config> {
+pub fn load(language: &str) -> Result<Config> {
     let path = path()?;
-    if !path.exists() {
-        return Ok(Config::default().effective());
+    let cfg = if path.exists() {
+        let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        toml::from_str(&text).context("parse hunspell.toml")?
+    } else {
+        Config::default()
+    };
+    Ok(resolve_dictionary(cfg, language).effective())
+}
+
+/// `settings.toml` language is the default; an explicit dictionary in
+/// `hunspell.toml` wins. The environment is applied later by `effective`.
+fn resolve_dictionary(mut cfg: Config, language: &str) -> Config {
+    if cfg.dictionary.trim().is_empty() {
+        let language = language.trim();
+        cfg.dictionary = if language.is_empty() {
+            DEFAULT_DICTIONARY.to_string()
+        } else {
+            language.to_string()
+        };
     }
-    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    let cfg: Config = toml::from_str(&text).context("parse hunspell.toml")?;
-    Ok(cfg.effective())
+    cfg
 }
 
 /// Check every eligible word in the paragraphs with one Hunspell process.
@@ -173,9 +190,9 @@ pub fn check_chapter(
         alternatives.dedup();
         alternatives.truncate(MAX_SUGGESTIONS);
         let message = if alternatives.is_empty() {
-            "Not in the Turkish dictionary; no suggestion.".to_string()
+            "Not in the dictionary; no suggestion.".to_string()
         } else {
-            "Not in the Turkish dictionary.".to_string()
+            "Not in the dictionary.".to_string()
         };
         findings.push(Finding {
             para: token.para,
@@ -425,7 +442,7 @@ fn run_hunspell(cfg: &Config, words: &[String]) -> Result<Vec<HunspellResult>> {
         .stderr(Stdio::piped());
     let mut child = command.spawn().with_context(|| {
         format!(
-            "could not run `{}`. Install hunspell and the Turkish dictionary, or set \
+            "could not run `{}`. Install hunspell and a dictionary, or set \
              binary/dictionary in ~/.config/scribe/hunspell.toml",
             cfg.binary
         )
@@ -662,6 +679,26 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("1 result group"));
+    }
+
+    #[test]
+    fn empty_dictionary_uses_the_settings_language() {
+        let cfg = resolve_dictionary(Config::default(), "en_US");
+        assert_eq!(cfg.dictionary, "en_US");
+        let cfg = resolve_dictionary(Config::default(), "");
+        assert_eq!(cfg.dictionary, DEFAULT_DICTIONARY);
+    }
+
+    #[test]
+    fn explicit_dictionary_wins_over_the_settings_language() {
+        let cfg = resolve_dictionary(
+            Config {
+                dictionary: "~/dict/custom".to_string(),
+                ..Config::default()
+            },
+            "en_US",
+        );
+        assert_eq!(cfg.dictionary, "~/dict/custom");
     }
 
     #[test]

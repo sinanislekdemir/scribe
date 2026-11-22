@@ -516,7 +516,7 @@ const MENUS: &[MenuDef] = &[
             },
             MenuEntry::Separator,
             MenuEntry::Item {
-                label: "Check Turkish spelling…",
+                label: "Check spelling…",
                 shortcut: "F5",
                 action: MenuAction::SpellCheck,
             },
@@ -864,9 +864,10 @@ enum ConfigField {
     Timeout,
     Theme,
     MaxWidth,
+    SpellLanguage,
 }
 
-const CONFIG_FIELDS: [ConfigField; 8] = [
+const CONFIG_FIELDS: [ConfigField; 9] = [
     ConfigField::BaseUrl,
     ConfigField::Model,
     ConfigField::ApiKey,
@@ -875,6 +876,7 @@ const CONFIG_FIELDS: [ConfigField; 8] = [
     ConfigField::Timeout,
     ConfigField::Theme,
     ConfigField::MaxWidth,
+    ConfigField::SpellLanguage,
 ];
 
 impl ConfigField {
@@ -883,11 +885,12 @@ impl ConfigField {
             ConfigField::BaseUrl => "Base URL",
             ConfigField::Model => "Model",
             ConfigField::ApiKey => "API key",
-            ConfigField::Language => "Language",
+            ConfigField::Language => "AI language",
             ConfigField::JsonMode => "JSON mode",
             ConfigField::Timeout => "Timeout",
             ConfigField::Theme => "Theme",
             ConfigField::MaxWidth => "Max width",
+            ConfigField::SpellLanguage => "Spell language",
         }
     }
 
@@ -899,6 +902,7 @@ impl ConfigField {
                 | ConfigField::ApiKey
                 | ConfigField::Language
                 | ConfigField::Timeout
+                | ConfigField::SpellLanguage
         )
     }
 }
@@ -907,6 +911,7 @@ struct ConfigPanel {
     ai: ai::AiConfig,
     original_theme: ThemeName,
     original_max_width: usize,
+    spell_language: String,
     selected: usize,
     editing: Option<Input>,
     status: Option<(String, bool)>,
@@ -914,11 +919,12 @@ struct ConfigPanel {
 }
 
 impl ConfigPanel {
-    fn new(ai: ai::AiConfig, theme: ThemeName, max_width: usize) -> Self {
+    fn new(ai: ai::AiConfig, theme: ThemeName, max_width: usize, spell_language: String) -> Self {
         Self {
             ai,
             original_theme: theme,
             original_max_width: max_width,
+            spell_language,
             selected: 0,
             editing: None,
             status: None,
@@ -961,6 +967,7 @@ impl ConfigPanel {
             }
             ConfigField::Timeout => format!("{} s", self.ai.timeout_seconds),
             ConfigField::Theme | ConfigField::MaxWidth => String::new(),
+            ConfigField::SpellLanguage => self.spell_language.clone(),
         }
     }
 
@@ -992,6 +999,13 @@ impl ConfigPanel {
                 }
             }
             ConfigField::Language => self.ai.language = value,
+            ConfigField::SpellLanguage => {
+                self.spell_language = if value.is_empty() {
+                    settings::DEFAULT_LANGUAGE.to_string()
+                } else {
+                    value
+                };
+            }
             ConfigField::Timeout => match value.parse::<u64>() {
                 Ok(seconds) => self.ai.timeout_seconds = seconds.max(5),
                 Err(_) => self.status = Some(("Timeout must be a number".to_string(), true)),
@@ -3568,7 +3582,12 @@ impl App {
                 ai::AiConfig::default()
             }
         };
-        let mut panel = ConfigPanel::new(ai, self.settings.theme, self.settings.max_width);
+        let mut panel = ConfigPanel::new(
+            ai,
+            self.settings.theme,
+            self.settings.max_width,
+            self.settings.language.clone(),
+        );
         panel.status = status;
         self.config_panel = Some(panel);
         self.overlay = Overlay::Config;
@@ -3617,23 +3636,31 @@ impl App {
     }
 
     fn save_config(&mut self) {
-        let Some(panel) = &mut self.config_panel else {
-            return;
+        let spell_language = {
+            let Some(panel) = &mut self.config_panel else {
+                return;
+            };
+            if panel.editing.is_some() {
+                panel.commit_edit();
+            }
+            if let Err(error) = panel.ai.validate() {
+                panel.set_status(format!("{error:#}"), true);
+                return;
+            }
+            let ai_config = panel.ai.clone();
+            if let Err(error) = ai::save(&ai_config) {
+                panel.set_status(format!("Could not save ai.toml: {error:#}"), true);
+                return;
+            }
+            panel.spell_language.trim().to_string()
         };
-        if panel.editing.is_some() {
-            panel.commit_edit();
-        }
-        if let Err(error) = panel.ai.validate() {
-            panel.set_status(format!("{error:#}"), true);
-            return;
-        }
-        let ai_config = panel.ai.clone();
-        if let Err(error) = ai::save(&ai_config) {
-            panel.set_status(format!("Could not save ai.toml: {error:#}"), true);
-            return;
+        if !spell_language.is_empty() {
+            self.settings.language = spell_language;
         }
         if let Err(error) = settings::save(&self.settings) {
-            panel.set_status(format!("Could not save settings.toml: {error:#}"), true);
+            if let Some(panel) = &mut self.config_panel {
+                panel.set_status(format!("Could not save settings.toml: {error:#}"), true);
+            }
             return;
         }
         self.config_panel = None;
@@ -3691,9 +3718,7 @@ impl App {
                             KeyCode::End => input.end(),
                             KeyCode::Backspace => input.backspace(),
                             KeyCode::Delete => input.delete(),
-                            KeyCode::Char(ch) if key.modifiers == KeyModifiers::NONE => {
-                                input.insert(ch)
-                            }
+                            KeyCode::Char(ch) if is_text_key(&key) => input.insert(ch),
                             _ => {}
                         }
                     }
@@ -3866,7 +3891,7 @@ impl App {
             return;
         }
 
-        let cfg = match spell::load() {
+        let cfg = match spell::load(&self.settings.language) {
             Ok(cfg) => cfg,
             Err(error) => {
                 self.ai_panel = Some(AiPanel::spell_error(
@@ -3917,7 +3942,7 @@ impl App {
         let dictionary = cfg.display_dictionary();
         self.ai_panel = Some(AiPanel::spell_checking(chapter, dictionary));
         self.overlay = Overlay::AiPanel;
-        self.toast("Checking Turkish spelling with hunspell…");
+        self.toast("Checking spelling with hunspell…");
 
         let tx = self.ai_tx.clone();
         std::thread::spawn(move || {
@@ -4344,7 +4369,7 @@ impl App {
                     if ed.current_chapter() != chapter {
                         self.ai_panel = None;
                         self.overlay = Overlay::None;
-                        self.toast("Chapter changed; Turkish check discarded.");
+                        self.toast("Chapter changed; spelling check discarded.");
                         continue;
                     }
                     if text_hash(&ed.chapter_texts(chapter)) != expected_hash {
@@ -4388,16 +4413,16 @@ impl App {
                                 panel.issues = issues;
                                 panel.alternatives = alternatives;
                                 panel.message = if count == 0 {
-                                    "No Turkish spelling issues found.".to_string()
+                                    "No spelling issues found.".to_string()
                                 } else {
                                     format!("{count} spelling suggestion(s).")
                                 };
                             }
                             self.reveal_ai_selection();
                             self.toast(if count == 0 {
-                                "No Turkish spelling issues found."
+                                "No spelling issues found."
                             } else {
-                                "Turkish spelling check complete."
+                                "Spelling check complete."
                             });
                         }
                         Err(error) => {
@@ -4408,7 +4433,7 @@ impl App {
                                 panel.alternatives.clear();
                                 panel.alt_selected = 0;
                             }
-                            self.toast("Turkish spelling check failed.");
+                            self.toast("Spelling check failed.");
                         }
                     }
                 }
@@ -4602,7 +4627,7 @@ impl App {
         let Some(issue) = panel.issues.get(panel.selected).cloned() else {
             return;
         };
-        let cfg = match spell::load() {
+        let cfg = match spell::load(&self.settings.language) {
             Ok(cfg) => cfg,
             Err(error) => {
                 self.toast(format!("Hunspell config error: {error}"));
@@ -5494,18 +5519,18 @@ impl App {
         let header = if panel.is_spell() {
             match panel.status {
                 AiStatus::Checking => format!(
-                    " Turkish check · chapter {} · checking · {} ",
+                    " Spell check · chapter {} · checking · {} ",
                     panel.chapter + 1,
                     panel.model
                 ),
                 AiStatus::Ready => format!(
-                    " Turkish check · chapter {} · {} suggestion(s) · {} ",
+                    " Spell check · chapter {} · {} suggestion(s) · {} ",
                     panel.chapter + 1,
                     panel.issues.len(),
                     panel.model
                 ),
                 AiStatus::Error => {
-                    format!(" Turkish check · chapter {} · error ", panel.chapter + 1)
+                    format!(" Spell check · chapter {} · error ", panel.chapter + 1)
                 }
             }
         } else {
@@ -5735,7 +5760,7 @@ impl App {
         let footer_y = inner.y + inner.height - 1;
         let status_y = footer_y.saturating_sub(1);
         let field_bottom = status_y.saturating_sub(1);
-        let label_w = 14u16;
+        let label_w = 17u16;
         let value_x = inner.x + label_w;
         let value_w = inner.width.saturating_sub(label_w);
         let mut y = inner.y;
@@ -5820,7 +5845,11 @@ impl App {
             );
             y += 1;
         }
-        for field in [ConfigField::Theme, ConfigField::MaxWidth] {
+        for field in [
+            ConfigField::Theme,
+            ConfigField::MaxWidth,
+            ConfigField::SpellLanguage,
+        ] {
             if y >= field_bottom {
                 break;
             }
@@ -5829,6 +5858,7 @@ impl App {
                 .position(|candidate| *candidate == field)
                 .unwrap_or(0);
             let selected = panel.selected == index;
+            let editing = selected && panel.editing.is_some();
             let row_style = if selected {
                 Style::default()
                     .bg(p.select_bg)
@@ -5845,31 +5875,47 @@ impl App {
                 inner.x + 1,
                 y,
                 field.label(),
-                label_w as usize,
+                (label_w - 1) as usize,
                 Style::default()
                     .bg(if selected { p.select_bg } else { p.panel_bg })
                     .fg(if selected { p.select_fg } else { p.dim }),
             );
-            let value = match field {
-                ConfigField::Theme => {
-                    let label = self.settings.theme.label();
-                    if selected {
-                        format!("◀ {label} ▶")
-                    } else {
-                        label.to_string()
+            let value = if let Some(input) = panel.editing.as_ref().filter(|_| editing) {
+                input.value.clone()
+            } else {
+                match field {
+                    ConfigField::Theme => {
+                        let label = self.settings.theme.label();
+                        if selected {
+                            format!("◀ {label} ▶")
+                        } else {
+                            label.to_string()
+                        }
                     }
-                }
-                ConfigField::MaxWidth => {
-                    let width = self.settings.max_width;
-                    if selected {
-                        format!("◀ {width} cols ▶")
-                    } else {
-                        format!("{width} cols")
+                    ConfigField::MaxWidth => {
+                        let width = self.settings.max_width;
+                        if selected {
+                            format!("◀ {width} cols ▶")
+                        } else {
+                            format!("{width} cols")
+                        }
                     }
+                    ConfigField::SpellLanguage => panel.spell_language.clone(),
+                    _ => String::new(),
                 }
-                _ => String::new(),
             };
             buf.set_stringn(value_x, y, &value, value_w as usize, row_style);
+            if editing {
+                let cursor_chars = panel
+                    .editing
+                    .as_ref()
+                    .map(|input| input.cursor.min(40))
+                    .unwrap_or(0);
+                let cx = value_x + cursor_chars as u16;
+                if cx < inner.x + inner.width {
+                    buf[(cx, y)].set_style(Style::default().bg(p.cursor_bg).fg(p.cursor_fg));
+                }
+            }
             y += 1;
         }
 
@@ -6676,7 +6722,7 @@ impl App {
             )),
             Line::from("Ctrl+O open from Nextcloud   Ctrl+S save now"),
             Line::from("F3 find                      Ctrl+, configuration"),
-            Line::from("F5 Turkish spelling          F8 AI writing check"),
+            Line::from("F5 spelling check            F8 AI writing check"),
             Line::from("F4 ask AI                    F6 show/hide AI answer"),
             Line::from("F7 notes sidecar             F9 menu bar · themes"),
             Line::from("Alt+H help / Alt+A about    PgUp/PgDn page"),
@@ -7741,7 +7787,12 @@ mod tests {
             api_key: "sk-verysecretvalue123".to_string(),
             ..ai::AiConfig::default()
         };
-        let mut panel = ConfigPanel::new(cfg, ThemeName::Monokai, settings::DEFAULT_MAX_WIDTH);
+        let mut panel = ConfigPanel::new(
+            cfg,
+            ThemeName::Monokai,
+            settings::DEFAULT_MAX_WIDTH,
+            settings::DEFAULT_LANGUAGE.to_string(),
+        );
         let shown = panel.display_key();
         assert!(!shown.contains("verysecretvalue"));
         assert!(shown.starts_with("sk-ve"));
@@ -7865,6 +7916,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shifted_letters_count_as_text_input() {
+        assert!(is_text_key(&KeyEvent::new(
+            KeyCode::Char('U'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(!is_text_key(&KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL
+        )));
+    }
+
     fn spell_issue(para: usize, start: usize, end: usize, word: &str) -> ai::Issue {
         ai::Issue {
             para,
@@ -7874,7 +7937,7 @@ mod tests {
             replacement: None,
             kind: "spelling".to_string(),
             severity: "warning".to_string(),
-            message: "Not in the Turkish dictionary.".to_string(),
+            message: "Not in the dictionary.".to_string(),
         }
     }
 
