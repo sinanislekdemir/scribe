@@ -12,6 +12,7 @@ use crate::config;
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com/v1";
 pub const DEFAULT_MODEL: &str = "deepseek-chat";
 const MAX_CHUNK_CHARS: usize = 12_000;
+const MAX_ASK_CHARS: usize = 30_000;
 
 /// Local AI provider configuration, stored separately from Nextcloud
 /// credentials in `~/.config/scribe/ai.toml`.
@@ -258,6 +259,88 @@ Return JSON only, with this shape:
 
 Use the paragraph index shown in brackets. If there are no issues, return {"issues":[]}."#;
 
+const ASK_SYSTEM_PROMPT: &str = r#"You are a thoughtful assistant helping an author with a book they are writing. The author gives you a passage or a chapter and asks a question about it.
+
+Answer the question directly and concisely, in plain text.
+Use the supplied text and general knowledge. If the answer depends on a specific sentence, quote it or point to it.
+For fact-checking or plausibility questions, explain what is plausible, what is not, and why. If you are unsure, say so instead of inventing details.
+Do not rewrite or edit the prose unless the author explicitly asks. Do not turn the answer into a list of copy-editing suggestions.
+The primary languages are Turkish and English. Answer in the language of the question unless it clearly asks for another language.
+
+Return plain text only, not JSON."#;
+
+/// Ask one free-form question about a selected passage or the current chapter.
+/// The answer is returned as plain text and is never applied to the document.
+pub fn ask(
+    cfg: &AiConfig,
+    question: &str,
+    scope: &str,
+    book_title: &str,
+    chapter_title: &str,
+    text: &str,
+) -> Result<String> {
+    let mut cfg = cfg.clone();
+    cfg.json_mode = false;
+    let user = build_ask_prompt(
+        question,
+        scope,
+        book_title,
+        chapter_title,
+        text,
+        &cfg.language,
+    );
+    let messages = [
+        Message {
+            role: "system",
+            content: ASK_SYSTEM_PROMPT,
+        },
+        Message {
+            role: "user",
+            content: &user,
+        },
+    ];
+    request_chat(&cfg, &messages, 2048).map(|answer| answer.trim().to_string())
+}
+
+fn build_ask_prompt(
+    question: &str,
+    scope: &str,
+    book_title: &str,
+    chapter_title: &str,
+    text: &str,
+    language: &str,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("Answer the author's question about the text below.\n");
+    prompt.push_str("Language: ");
+    prompt.push_str(language_hint(language));
+    prompt.push('\n');
+    if !book_title.trim().is_empty() {
+        prompt.push_str("Book: ");
+        prompt.push_str(book_title.trim());
+        prompt.push('\n');
+    }
+    if !chapter_title.trim().is_empty() {
+        prompt.push_str("Chapter: ");
+        prompt.push_str(chapter_title.trim());
+        prompt.push('\n');
+    }
+    prompt.push_str("Scope: ");
+    prompt.push_str(scope);
+    prompt.push_str("\n\nText:\n");
+    let char_count = text.chars().count();
+    if char_count > MAX_ASK_CHARS {
+        prompt.extend(text.chars().take(MAX_ASK_CHARS));
+        prompt.push_str("\n[Text truncated for length.]");
+    } else {
+        prompt.push_str(text);
+    }
+    prompt.push_str("\n\nQuestion: ");
+    prompt.push_str(question.trim());
+    prompt.push('\n');
+    prompt
+}
+
 /// Check one chapter. Paragraphs are indexed from zero. Progress is reported
 /// after each request when the chapter is split into chunks.
 pub fn check_chapter<F>(
@@ -338,16 +421,10 @@ fn build_chunks(paragraphs: &[String]) -> Vec<Chunk> {
 }
 
 fn build_user_prompt(chunk: &Chunk, language: &str) -> String {
-    let hint = match language.trim() {
-        "" | "auto" => "Auto-detect the language. The primary languages are Turkish and English.",
-        "tr" | "tr-TR" | "turkish" | "Türkçe" => "The text is Turkish.",
-        "en" | "en-US" | "en-GB" | "english" => "The text is English.",
-        other => other,
-    };
     let mut prompt = String::new();
     prompt.push_str("Check the following chapter paragraphs for objective writing errors.\n");
     prompt.push_str("Language: ");
-    prompt.push_str(hint);
+    prompt.push_str(language_hint(language));
     prompt.push_str("\n\nParagraphs (the number in brackets is the paragraph index):\n");
     for (index, text) in &chunk.items {
         prompt.push('[');
@@ -358,6 +435,15 @@ fn build_user_prompt(chunk: &Chunk, language: &str) -> String {
     }
     prompt.push_str("\nReturn only the JSON object described in the system prompt.\n");
     prompt
+}
+
+fn language_hint(language: &str) -> &str {
+    match language.trim() {
+        "" | "auto" => "Auto-detect the language. The primary languages are Turkish and English.",
+        "tr" | "tr-TR" | "turkish" | "Türkçe" => "The text is Turkish.",
+        "en" | "en-US" | "en-GB" | "english" => "The text is English.",
+        other => other,
+    }
 }
 
 fn request_chat(cfg: &AiConfig, messages: &[Message<'_>], max_tokens: u32) -> Result<String> {
@@ -581,6 +667,33 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].items.len(), 1);
         assert_eq!(chunks[1].items.len(), 1);
+    }
+
+    #[test]
+    fn ask_prompt_keeps_scope_question_and_text() {
+        let prompt = build_ask_prompt(
+            "Can he really drive that car?",
+            "the selected passage",
+            "My Book",
+            "3. The Garage",
+            "He shifted into fourth and the engine screamed.",
+            "en",
+        );
+        assert!(prompt.contains("The text is English."));
+        assert!(prompt.contains("Book: My Book"));
+        assert!(prompt.contains("Chapter: 3. The Garage"));
+        assert!(prompt.contains("Scope: the selected passage"));
+        assert!(prompt.contains("He shifted into fourth"));
+        assert!(prompt.contains("Question: Can he really drive that car?"));
+        assert!(!prompt.contains("Return only the JSON"));
+    }
+
+    #[test]
+    fn ask_prompt_truncates_long_text() {
+        let text = "x".repeat(MAX_ASK_CHARS + 50);
+        let prompt = build_ask_prompt("why?", "the current chapter", "", "", &text, "auto");
+        assert!(prompt.contains("[Text truncated for length.]"));
+        assert!(prompt.chars().count() < MAX_ASK_CHARS + 300);
     }
 
     #[test]

@@ -680,6 +680,18 @@ impl Editor {
         Some(ClipText { paragraphs })
     }
 
+    /// The marked range as plain paragraph strings. Used for AI questions; it
+    /// never touches the document or the internal clipboard.
+    pub fn selection_texts(&self) -> Option<Vec<String>> {
+        let clip = self.copy_selection()?;
+        Some(
+            clip.paragraphs
+                .iter()
+                .map(|chars| chars.iter().map(|c| c.ch).collect())
+                .collect(),
+        )
+    }
+
     /// Copy the marked range and remove it from the document in one undo step.
     pub fn cut_selection(&mut self) -> Option<ClipText> {
         let clip = self.copy_selection()?;

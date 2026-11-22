@@ -53,6 +53,10 @@ fn main() -> Result<()> {
             print_help();
             Ok(())
         }
+        Some("version") | Some("--version") | Some("-V") => {
+            println!("scribe {}", app::app_version());
+            Ok(())
+        }
         Some("ai-config") => run_ai_config(&args[2..]),
         Some("inspect") => {
             let path = args.get(2).context("usage: scribe inspect <file.odt>")?;
@@ -296,6 +300,7 @@ fn print_help() {
            scribe login [URL]     log in to Nextcloud through the browser\n\
            scribe login --manual  enter Nextcloud URL + app password\n\
            scribe logout          remove local credentials\n\
+           scribe version         print the version\n\
            scribe open FILE.odt   edit a local ODT file (no login required)\n\
            scribe FILE.odt        same as open\n\
            scribe ai-config       configure the AI writing check\n\

@@ -110,6 +110,16 @@ scribe roundtrip in.odt out.odt
 - Dismissing removes a suggestion from the current result set only; a fresh check may show it again.
 - AI failures (missing config, HTTP error, malformed JSON) are non-fatal and must never affect saving, locking, or the book model.
 
+### Ask AI
+
+- `F4` (and `Tools → Ask AI…`) asks a free-form question about the active **selection** when one exists, otherwise about the **current chapter**. `Tab` in the prompt toggles selection/chapter when a selection exists.
+- The answer is a **temporary read-only buffer in the editor area**, toggled with `F6`. It is not an `Editor`, not an ODT document, and is never saved or auto-inserted. Do not turn it into an editable document session.
+- Keep `ask`, `ask_job`, and `ask_view` separate from the `ai_panel` check state. `F6` must work while a request is pending. A new question replaces the old answer; opening another file, switching to notes, or clearing the document session must call `clear_ai_answer`.
+- The request runs on the existing AI worker pattern (`AiEvent::AskDone`) and is ignored when its job id no longer matches `ask_job`.
+- `R` retries from the stored `AskAnswer.source` snapshot, not from the current cursor, so a retry asks the same question about the same passage.
+- The ask prompt in `src/ai.rs` is plain text and must not be turned into the JSON copy-editor prompt. It answers questions and must not rewrite prose unless explicitly asked.
+- While `ask_view` is active, editing keys, search, and the menu are disabled; only scrolling, `R`, `Esc`/`F6`, and the global redraw/help/config keys run. `F6` and `F4` are handled before the answer-view handler.
+
 ### Nextcloud / networking
 
 - Use **ureq 2.12**, not ureq 3. ureq 3 rejects WebDAV `PROPFIND` with `MethodVersionMismatch`; this was the reason for the downgrade.

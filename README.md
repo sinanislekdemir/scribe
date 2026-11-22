@@ -32,6 +32,8 @@ Built for a narrow document shape:
 - bold / italic / underline / strikethrough with real ODT character styles
 - a notes sidecar document (`.notes.odt`) toggled with `F7`
 - built-in case-insensitive find (`F3`) with no replace
+- ask AI about a selection or chapter (`F4`) and read the answer in a temporary
+  buffer toggled with `F6`
 
 The TUI is intentionally small: one chapter at a time, a centered 120-column text area, terminal-sized pages, total word/char/page counts, and autosave. When the cursor crosses the bottom of the page, the view scrolls forward by 75%, keeping the last 25% of the previous page visible for context.
 
@@ -139,6 +141,12 @@ scribe path/to/book.odt
 
 Only `.odt` files are accepted. `.docx` is not supported at any level.
 
+Print the version (also available as `scribe version` / `-V`):
+
+```bash
+scribe --version
+```
+
 ## Keybindings
 
 | Key | Action |
@@ -146,6 +154,8 @@ Only `.odt` files are accepted. `.docx` is not supported at any level.
 | `F9` | Open/close the top menu (arrows navigate, Enter runs) |
 | `F7` | Switch to/from the notes sidecar (creates it on first use) |
 | `F8` | AI writing check for the current chapter (opens the suggestions panel) |
+| `F4` | Ask AI a question about the selection or current chapter |
+| `F6` | Show/hide the temporary AI answer buffer |
 | `F3` | Find in the active document; press again for the next match |
 | `Ctrl+,` / `Alt+,` | Open the configuration panel (AI settings and theme) |
 | `Ctrl+O` | Open an ODT from Nextcloud |
@@ -331,8 +341,36 @@ text no longer matches are dropped instead of guessed. If the chapter changes
 while a request is running, the result is discarded and you can press `R` to run
 again.
 
-Privacy: the current chapter is sent to the configured endpoint. Local Ollama
-keeps it on the machine; DeepSeek/OpenAI receive it over HTTPS.
+## Ask AI about a passage
+
+`F4` (or `Tools → Ask AI…`) opens a question prompt. If there is an active
+selection, the question is about the selected text; otherwise it is about the
+current chapter. With a selection, press `Tab` in the prompt to switch between
+`selection` and `chapter`. The prompt is a single line: `Enter` sends it and
+`Esc` cancels.
+
+The answer appears in a temporary read-only buffer in the editor area. It is
+not part of the document, is never saved, and cannot be edited. Press `F6` (or
+`Tools → AI answer`) to switch between the answer and the document at any time,
+including while the answer is still being written. In the answer buffer:
+
+| Key | Action |
+|---|---|
+| `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` | Scroll the answer |
+| `R` | Ask the same question again |
+| `Esc` / `F6` | Back to the document |
+| `F4` | Ask a new question |
+
+A new question replaces the old answer; switching files or to the notes
+sidecar clears the temporary buffer. The question and the selected passage (or
+chapter) are sent to the same endpoint as the writing check. The answer is
+advisory only: scribe never changes the text from it. The status bar shows
+`AI answer F6` when an answer is waiting in the background and `AI ANSWER` while
+you are viewing it.
+
+Privacy: the current chapter or selected passage, plus your question, is sent to
+the configured endpoint. Local Ollama keeps it on the machine;
+DeepSeek/OpenAI receive it over HTTPS.
 
 ## File locking
 

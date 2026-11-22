@@ -38,7 +38,7 @@ const STATUS_CLOCK_TIME: &str = "%H:%M";
 const STATUS_CLOCK_GAP: usize = 2;
 const STATUS_CLOCK_MIN_WIDTH: u16 = 30;
 
-fn app_version() -> &'static str {
+pub(crate) fn app_version() -> &'static str {
     option_env!("SCRIBE_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
@@ -112,6 +112,7 @@ enum InputKind {
     NewFileName,
     SaveCopy,
     ConfigField,
+    AiQuestion(AskScope),
 }
 
 impl Input {
@@ -313,6 +314,8 @@ enum MenuAction {
     Redraw,
     Help,
     AiCheck,
+    AiAsk,
+    AiAnswer,
     Config,
     Notes,
     About,
@@ -515,6 +518,16 @@ const MENUS: &[MenuDef] = &[
                 shortcut: "F8",
                 action: MenuAction::AiCheck,
             },
+            MenuEntry::Item {
+                label: "Ask AI…",
+                shortcut: "F4",
+                action: MenuAction::AiAsk,
+            },
+            MenuEntry::Item {
+                label: "AI answer",
+                shortcut: "F6",
+                action: MenuAction::AiAnswer,
+            },
         ],
     },
     MenuDef {
@@ -639,6 +652,10 @@ enum AiEvent {
         text_hash: u64,
         result: std::result::Result<Vec<ai::Issue>, String>,
     },
+    AskDone {
+        job_id: u64,
+        result: std::result::Result<String, String>,
+    },
     TestDone {
         result: std::result::Result<String, String>,
     },
@@ -697,6 +714,51 @@ impl AiPanel {
             scroll: 0,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AskScope {
+    Selection,
+    Chapter,
+}
+
+impl AskScope {
+    fn label(self) -> &'static str {
+        match self {
+            AskScope::Selection => "selection",
+            AskScope::Chapter => "chapter",
+        }
+    }
+
+    fn phrase(self) -> &'static str {
+        match self {
+            AskScope::Selection => "the selected passage",
+            AskScope::Chapter => "the current chapter",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AskStatus {
+    Pending,
+    Ready,
+    Error,
+}
+
+/// A temporary read-only answer buffer. It is never part of the document and
+/// is never saved; `source` is kept only so `R` can retry the same question.
+struct AskAnswer {
+    question: String,
+    scope: AskScope,
+    chapter: usize,
+    book_title: String,
+    chapter_heading: String,
+    source: String,
+    status: AskStatus,
+    answer: String,
+    message: String,
+    model: String,
+    scroll: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -911,6 +973,9 @@ pub struct App {
     ai_seq: u64,
     ai_job: Option<AiJob>,
     ai_panel: Option<AiPanel>,
+    ask: Option<AskAnswer>,
+    ask_job: Option<u64>,
+    ask_view: bool,
     settings: Settings,
     palette: Palette,
     config_panel: Option<ConfigPanel>,
@@ -984,6 +1049,9 @@ impl App {
             ai_seq: 0,
             ai_job: None,
             ai_panel: None,
+            ask: None,
+            ask_job: None,
+            ask_view: false,
             settings: ui_settings,
             palette,
             config_panel: None,
@@ -1051,6 +1119,9 @@ impl App {
             ai_seq: 0,
             ai_job: None,
             ai_panel: None,
+            ask: None,
+            ask_job: None,
+            ask_view: false,
             settings: ui_settings,
             palette,
             config_panel: None,
@@ -1158,6 +1229,7 @@ impl App {
         self.create_new = create_new;
         self.editor = Some(ed);
         self.search = SearchState::default();
+        self.clear_ai_answer();
         self.overlay = Overlay::None;
         self.file_picker = None;
         self.chapter_picker = None;
@@ -2187,7 +2259,7 @@ impl App {
             return;
         }
         if key.code == KeyCode::F(3) {
-            if self.overlay == Overlay::None {
+            if self.overlay == Overlay::None && !self.ask_view {
                 if self.search.active {
                     self.search_next();
                 } else {
@@ -2201,6 +2273,9 @@ impl App {
             return;
         }
         if key.code == KeyCode::F(9) {
+            if self.ask_view {
+                return;
+            }
             match self.overlay {
                 Overlay::None => self.open_menu(),
                 Overlay::Menu => self.overlay = Overlay::None,
@@ -2214,9 +2289,22 @@ impl App {
         }
         if key.code == KeyCode::F(8) {
             match self.overlay {
-                Overlay::None => self.action_ai_check(),
+                Overlay::None if !self.ask_view => self.action_ai_check(),
                 Overlay::AiPanel => self.close_ai_panel(),
                 _ => {}
+            }
+            return;
+        }
+        if key.code == KeyCode::F(4) {
+            match self.overlay {
+                Overlay::None | Overlay::Selection => self.action_ai_ask(),
+                _ => {}
+            }
+            return;
+        }
+        if key.code == KeyCode::F(6) {
+            if self.overlay == Overlay::None {
+                self.toggle_ai_answer();
             }
             return;
         }
@@ -2259,6 +2347,10 @@ impl App {
                 Overlay::None | Overlay::Menu => self.action_config(),
                 _ => {}
             }
+            return;
+        }
+        if self.ask_view && self.overlay == Overlay::None {
+            self.handle_ai_answer_key(key);
             return;
         }
         match self.overlay {
@@ -2453,6 +2545,8 @@ impl App {
             | MenuAction::About => true,
             MenuAction::Open => self.client.is_some(),
             MenuAction::AiCheck => self.editor.is_some(),
+            MenuAction::AiAsk => self.editor.is_some(),
+            MenuAction::AiAnswer => self.editor.is_some() && self.ask.is_some(),
             MenuAction::Notes => self.editor.is_some() && !self.notes_loading,
             MenuAction::DownloadCopy => self.remote_path.is_some() && self.editor.is_some(),
             MenuAction::Cut
@@ -2574,6 +2668,8 @@ impl App {
             MenuAction::Redraw => self.action_redraw(),
             MenuAction::Help => self.action_help(),
             MenuAction::AiCheck => self.action_ai_check(),
+            MenuAction::AiAsk => self.action_ai_ask(),
+            MenuAction::AiAnswer => self.toggle_ai_answer(),
             MenuAction::Config => self.action_config(),
             MenuAction::Notes => self.action_notes(),
             MenuAction::About => self.action_about(),
@@ -3086,6 +3182,7 @@ impl App {
             return;
         }
         self.search = SearchState::default();
+        self.clear_ai_answer();
         if self.notes_active {
             self.leave_notes();
         } else {
@@ -3347,6 +3444,7 @@ impl App {
         self.notes_main = None;
         self.notes_doc = None;
         self.pending_notes = None;
+        self.clear_ai_answer();
     }
 
     fn action_config(&mut self) {
@@ -3564,6 +3662,7 @@ impl App {
     }
 
     fn action_ai_check(&mut self) {
+        self.ask_view = false;
         let Some(ed) = &self.editor else {
             return;
         };
@@ -3638,6 +3737,273 @@ impl App {
         self.ai_job = None;
         if self.overlay == Overlay::AiPanel {
             self.overlay = Overlay::None;
+        }
+    }
+
+    fn ai_ready(&mut self) -> bool {
+        match ai::load() {
+            Ok(Some(cfg)) => match cfg.effective().validate() {
+                Ok(()) => true,
+                Err(error) => {
+                    self.toast(format!("AI config error: {error}"));
+                    false
+                }
+            },
+            Ok(None) => {
+                self.toast("AI is not configured. Run `scribe ai-config`.");
+                false
+            }
+            Err(error) => {
+                self.toast(format!("AI config error: {error}"));
+                false
+            }
+        }
+    }
+
+    fn action_ai_ask(&mut self) {
+        self.ask_view = false;
+        let Some(ed) = &self.editor else {
+            return;
+        };
+        let chapter = ed.current_chapter();
+        let has_selection = ed.has_selection();
+        let scope = if has_selection {
+            AskScope::Selection
+        } else {
+            AskScope::Chapter
+        };
+        if scope == AskScope::Chapter
+            && ed
+                .chapter_texts(chapter)
+                .iter()
+                .all(|p| p.trim().is_empty())
+        {
+            self.toast("This chapter is empty.");
+            return;
+        }
+        if !self.ai_ready() {
+            return;
+        }
+        self.selection_menu = None;
+        self.input = Some(Input::new(
+            InputKind::AiQuestion(scope),
+            ask_prompt_label(scope, has_selection),
+            "",
+        ));
+        self.overlay = Overlay::Input;
+    }
+
+    fn start_ai_ask(&mut self, question: String, scope: AskScope) {
+        let Some(ed) = &self.editor else {
+            return;
+        };
+        let chapter = ed.current_chapter();
+        let book_title = ed.doc.book.title.clone();
+        let chapter_heading = ed.doc.book.heading_text(chapter);
+        let paragraphs = match scope {
+            AskScope::Selection => match ed.selection_texts() {
+                Some(paragraphs) => paragraphs,
+                None => {
+                    self.toast("There is no selection to ask about.");
+                    return;
+                }
+            },
+            AskScope::Chapter => ed.chapter_texts(chapter),
+        };
+        let source = paragraphs.join("\n\n");
+        if source.trim().is_empty() {
+            self.toast("There is no text to ask about.");
+            return;
+        }
+        self.run_ai_ask(
+            question,
+            scope,
+            chapter,
+            book_title,
+            chapter_heading,
+            source,
+        );
+    }
+
+    fn run_ai_ask(
+        &mut self,
+        question: String,
+        scope: AskScope,
+        chapter: usize,
+        book_title: String,
+        chapter_heading: String,
+        source: String,
+    ) {
+        let mut answer = AskAnswer {
+            question,
+            scope,
+            chapter,
+            book_title,
+            chapter_heading,
+            source,
+            status: AskStatus::Pending,
+            answer: String::new(),
+            message: "Asking the AI…".to_string(),
+            model: String::new(),
+            scroll: 0,
+        };
+
+        let cfg = match ai::load() {
+            Ok(Some(cfg)) => {
+                let cfg = cfg.effective();
+                if let Err(error) = cfg.validate() {
+                    answer.status = AskStatus::Error;
+                    answer.message = format!("AI config error: {error}");
+                    self.ask = Some(answer);
+                    self.ask_job = None;
+                    self.ask_view = true;
+                    self.overlay = Overlay::None;
+                    self.toast("AI configuration error.");
+                    return;
+                }
+                cfg
+            }
+            Ok(None) => {
+                answer.status = AskStatus::Error;
+                answer.message = "AI is not configured. Run `scribe ai-config`.".to_string();
+                self.ask = Some(answer);
+                self.ask_job = None;
+                self.ask_view = true;
+                self.overlay = Overlay::None;
+                self.toast("AI is not configured.");
+                return;
+            }
+            Err(error) => {
+                answer.status = AskStatus::Error;
+                answer.message = format!("AI config error: {error}");
+                self.ask = Some(answer);
+                self.ask_job = None;
+                self.ask_view = true;
+                self.overlay = Overlay::None;
+                self.toast("AI configuration error.");
+                return;
+            }
+        };
+
+        answer.model = cfg.model.clone();
+        self.ai_seq = self.ai_seq.wrapping_add(1);
+        let job_id = self.ai_seq;
+        self.ask_job = Some(job_id);
+        let question = answer.question.clone();
+        let book_title = answer.book_title.clone();
+        let chapter_heading = answer.chapter_heading.clone();
+        let source = answer.source.clone();
+        self.ask = Some(answer);
+        self.ask_view = true;
+        self.overlay = Overlay::None;
+        self.toast("Asking AI…");
+
+        let tx = self.ai_tx.clone();
+        std::thread::spawn(move || {
+            let result = ai::ask(
+                &cfg,
+                &question,
+                scope.phrase(),
+                &book_title,
+                &chapter_heading,
+                &source,
+            )
+            .map_err(|error| format!("{error}"));
+            let _ = tx.send(AiEvent::AskDone { job_id, result });
+        });
+    }
+
+    fn retry_ai_ask(&mut self) {
+        let Some(answer) = &self.ask else {
+            return;
+        };
+        let question = answer.question.clone();
+        let scope = answer.scope;
+        let chapter = answer.chapter;
+        let book_title = answer.book_title.clone();
+        let chapter_heading = answer.chapter_heading.clone();
+        let source = answer.source.clone();
+        self.run_ai_ask(
+            question,
+            scope,
+            chapter,
+            book_title,
+            chapter_heading,
+            source,
+        );
+    }
+
+    fn toggle_ai_answer(&mut self) {
+        if self.ask.is_none() {
+            self.toast("No AI answer yet. Press F4 to ask a question.");
+            return;
+        }
+        self.ask_view = !self.ask_view;
+        self.toast(if self.ask_view {
+            "AI answer. F6 returns to the document."
+        } else {
+            "Back to the document."
+        });
+    }
+
+    fn clear_ai_answer(&mut self) {
+        self.ask = None;
+        self.ask_job = None;
+        self.ask_view = false;
+    }
+
+    fn handle_ai_answer_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.ask_view = false;
+                self.toast("Back to the document.");
+            }
+            KeyCode::Up => self.scroll_ai_answer(-1),
+            KeyCode::Down => self.scroll_ai_answer(1),
+            KeyCode::PageUp => self.scroll_ai_answer(-(self.ai_answer_height() as isize)),
+            KeyCode::PageDown => self.scroll_ai_answer(self.ai_answer_height() as isize),
+            KeyCode::Home => self.set_ai_answer_scroll(0),
+            KeyCode::End => {
+                let max = self.ai_answer_max_scroll();
+                self.set_ai_answer_scroll(max);
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => self.retry_ai_ask(),
+            _ => {}
+        }
+    }
+
+    fn ai_answer_text_width(&self) -> usize {
+        let (width, _) = crossterm::terminal::size().unwrap_or((100, 40));
+        (width as usize)
+            .saturating_sub(4)
+            .clamp(1, self.settings.max_width)
+    }
+
+    fn ai_answer_height(&self) -> usize {
+        let (_, height) = crossterm::terminal::size().unwrap_or((100, 40));
+        (height as usize).saturating_sub(2)
+    }
+
+    fn ai_answer_max_scroll(&self) -> usize {
+        let Some(answer) = &self.ask else {
+            return 0;
+        };
+        ask_buffer_lines(answer, self.ai_answer_text_width())
+            .len()
+            .saturating_sub(self.ai_answer_height())
+    }
+
+    fn scroll_ai_answer(&mut self, delta: isize) {
+        let max = self.ai_answer_max_scroll() as isize;
+        if let Some(answer) = &mut self.ask {
+            answer.scroll = (answer.scroll as isize + delta).clamp(0, max) as usize;
+        }
+    }
+
+    fn set_ai_answer_scroll(&mut self, value: usize) {
+        let max = self.ai_answer_max_scroll();
+        if let Some(answer) = &mut self.ask {
+            answer.scroll = value.min(max);
         }
     }
 
@@ -3729,6 +4095,33 @@ impl App {
                                 panel.issues.clear();
                             }
                             self.toast("AI check failed.");
+                        }
+                    }
+                }
+                AiEvent::AskDone { job_id, result } => {
+                    if self.ask_job != Some(job_id) {
+                        continue;
+                    }
+                    self.ask_job = None;
+                    let Some(answer) = &mut self.ask else {
+                        continue;
+                    };
+                    match result {
+                        Ok(text) => {
+                            answer.status = AskStatus::Ready;
+                            answer.answer = text;
+                            answer.message.clear();
+                            answer.scroll = 0;
+                            if self.ask_view {
+                                self.toast("AI answer ready.");
+                            } else {
+                                self.toast("AI answer ready. Press F6 to view.");
+                            }
+                        }
+                        Err(error) => {
+                            answer.status = AskStatus::Error;
+                            answer.message = error;
+                            self.toast("AI request failed.");
                         }
                     }
                 }
@@ -4033,6 +4426,10 @@ impl App {
             KeyCode::Enter => {
                 let kind = input.kind.clone();
                 let value = input.value.trim().to_string();
+                if value.is_empty() && matches!(kind, InputKind::AiQuestion(_)) {
+                    self.toast("Type a question first.");
+                    return;
+                }
                 self.input = None;
                 self.overlay = Overlay::None;
                 match kind {
@@ -4070,6 +4467,25 @@ impl App {
                         self.save_copy(&value);
                     }
                     InputKind::ConfigField => {}
+                    InputKind::AiQuestion(scope) => self.start_ai_ask(value, scope),
+                }
+            }
+            KeyCode::Tab if matches!(input.kind, InputKind::AiQuestion(_)) => {
+                if self
+                    .editor
+                    .as_ref()
+                    .is_some_and(|editor| editor.has_selection())
+                {
+                    let current = match &input.kind {
+                        InputKind::AiQuestion(scope) => *scope,
+                        _ => unreachable!(),
+                    };
+                    let next = match current {
+                        AskScope::Selection => AskScope::Chapter,
+                        AskScope::Chapter => AskScope::Selection,
+                    };
+                    input.kind = InputKind::AiQuestion(next);
+                    input.label = ask_prompt_label(next, true);
                 }
             }
             KeyCode::Backspace => input.backspace(),
@@ -4578,7 +4994,9 @@ impl App {
         };
         frame.render_widget(Clear, editor_area);
         fill_default_bg(frame.buffer_mut(), editor_area, p.editor_bg);
-        if let Some(ed) = &self.editor {
+        if self.ask_view && self.ask.is_some() {
+            self.draw_ask_answer(frame, editor_area);
+        } else if let Some(ed) = &self.editor {
             self.draw_editor(frame, ed, editor_area);
         } else {
             self.draw_empty(frame, editor_area);
@@ -5366,6 +5784,67 @@ impl App {
         }
     }
 
+    fn draw_ask_answer(&self, frame: &mut Frame, area: Rect) {
+        let p = self.palette;
+        let Some(answer) = &self.ask else {
+            return;
+        };
+        let width = area.width as usize;
+        let tw = (width.saturating_sub(4)).clamp(1, self.settings.max_width);
+        let margin = width.saturating_sub(tw) / 2;
+        let has_left = margin >= 1;
+        let has_right = margin + tw < width;
+        let page_x = if has_left { margin - 1 } else { margin };
+        let page_end = if has_right {
+            margin + tw + 1
+        } else {
+            margin + tw
+        };
+        let page_w = page_end
+            .saturating_sub(page_x)
+            .min(width.saturating_sub(page_x));
+        let page_rect = Rect {
+            x: page_x as u16,
+            y: area.y,
+            width: page_w as u16,
+            height: area.height,
+        };
+        fill_bg(frame.buffer_mut(), page_rect, p.page_bg);
+
+        let lines = ask_buffer_lines(answer, tw);
+        let view = area.height as usize;
+        let max_scroll = lines.len().saturating_sub(view);
+        let scroll = answer.scroll.min(max_scroll);
+        let buf = frame.buffer_mut();
+        for (row, line) in lines.iter().skip(scroll).take(view).enumerate() {
+            let style = match line.kind {
+                AskLineKind::Header => Style::default()
+                    .bg(p.page_bg)
+                    .fg(p.heading)
+                    .add_modifier(Modifier::BOLD),
+                AskLineKind::Question => Style::default().bg(p.page_bg).fg(p.dim),
+                AskLineKind::Body => Style::default().bg(p.page_bg).fg(p.plain),
+                AskLineKind::Status => Style::default().bg(p.page_bg).fg(p.accent),
+                AskLineKind::Error => Style::default().bg(p.page_bg).fg(p.error),
+            };
+            buf.set_stringn(margin as u16, area.y + row as u16, &line.text, tw, style);
+        }
+        if has_left {
+            let x = (margin - 1) as u16;
+            for y in area.y..area.y.saturating_add(area.height) {
+                buf[(x, y)].set_char('│');
+                buf[(x, y)].set_style(Style::default().fg(p.page_border).bg(p.page_bg));
+            }
+        }
+        if has_right {
+            let x = (margin + tw) as u16;
+            for y in area.y..area.y.saturating_add(area.height) {
+                buf[(x, y)].set_char('│');
+                buf[(x, y)].set_style(Style::default().fg(p.page_border).bg(p.page_bg));
+            }
+        }
+    }
+
     fn draw_empty(&self, frame: &mut Frame, area: Rect) {
         let p = self.palette;
         let text = vec![
@@ -5477,6 +5956,21 @@ impl App {
         let mut spans: Vec<Span> = Vec::new();
         if let Some((msg, _)) = &self.toast {
             spans.push(Span::styled(msg.clone(), Style::default().fg(p.accent)));
+            spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
+        }
+        if let Some(answer) = &self.ask {
+            let (label, color) = match answer.status {
+                AskStatus::Pending => ("AI ANSWER…", p.accent),
+                AskStatus::Ready => ("AI ANSWER", p.accent),
+                AskStatus::Error => ("AI ANSWER!", p.error),
+            };
+            spans.push(Span::styled(
+                label,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ));
+            if !self.ask_view {
+                spans.push(Span::styled(" F6", Style::default().fg(p.dim)));
+            }
             spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
         }
         if let Some(ed) = &self.editor {
@@ -5673,7 +6167,7 @@ impl App {
     fn draw_help(&self, frame: &mut Frame) {
         let p = self.palette;
         let area = frame.area();
-        let rect = centered(area, 76.min(area.width), 33.min(area.height));
+        let rect = centered(area, 76.min(area.width), 34.min(area.height));
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -5721,6 +6215,7 @@ impl App {
             Line::from("Ctrl+O open from Nextcloud   Ctrl+S save now"),
             Line::from("F3 find                      Ctrl+, configuration"),
             Line::from("F7 notes sidecar             F8 AI writing check"),
+            Line::from("F4 ask AI                    F6 show/hide AI answer"),
             Line::from("F9 menu bar · themes: Tools → Configuration"),
             Line::from("Alt+H help / Alt+A about    PgUp/PgDn page"),
             Line::from("Ctrl+Home/End chapter start/end"),
@@ -6414,6 +6909,137 @@ fn search_query_capacity(width: u16) -> usize {
         .max(1)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AskLineKind {
+    Header,
+    Question,
+    Body,
+    Status,
+    Error,
+}
+
+struct AskLine {
+    text: String,
+    kind: AskLineKind,
+}
+
+fn ask_prompt_label(scope: AskScope, can_toggle: bool) -> String {
+    if can_toggle {
+        match scope {
+            AskScope::Selection => "Ask AI about selection (Tab: chapter)".to_string(),
+            AskScope::Chapter => "Ask AI about chapter (Tab: selection)".to_string(),
+        }
+    } else {
+        "Ask AI about chapter".to_string()
+    }
+}
+
+fn ask_buffer_lines(answer: &AskAnswer, width: usize) -> Vec<AskLine> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let heading = if answer.chapter_heading.trim().is_empty() {
+        format!("Chapter {}", answer.chapter + 1)
+    } else {
+        answer.chapter_heading.clone()
+    };
+    let header = if answer.model.trim().is_empty() {
+        format!("AI answer · {} · {}", heading, answer.scope.label())
+    } else {
+        format!(
+            "AI answer · {} · {} · {}",
+            heading,
+            answer.scope.label(),
+            answer.model
+        )
+    };
+    push_ask_lines(&mut lines, &header, width, AskLineKind::Header);
+    push_ask_lines(&mut lines, "", width, AskLineKind::Body);
+    push_ask_lines(
+        &mut lines,
+        &format!("Q: {}", answer.question),
+        width,
+        AskLineKind::Question,
+    );
+    push_ask_lines(&mut lines, "", width, AskLineKind::Body);
+    match answer.status {
+        AskStatus::Pending => {
+            push_ask_lines(&mut lines, &answer.message, width, AskLineKind::Status);
+        }
+        AskStatus::Ready => {
+            let text = if answer.answer.trim().is_empty() {
+                "(The AI returned an empty answer.)"
+            } else {
+                &answer.answer
+            };
+            push_ask_lines(&mut lines, text, width, AskLineKind::Body);
+        }
+        AskStatus::Error => {
+            push_ask_lines(&mut lines, &answer.message, width, AskLineKind::Error);
+            push_ask_lines(&mut lines, "", width, AskLineKind::Body);
+            push_ask_lines(
+                &mut lines,
+                "Press R to retry or F4 to ask another question.",
+                width,
+                AskLineKind::Status,
+            );
+        }
+    }
+    lines
+}
+
+fn push_ask_lines(out: &mut Vec<AskLine>, text: &str, width: usize, kind: AskLineKind) {
+    for line in wrap_display(text, width) {
+        out.push(AskLine { text: line, kind });
+    }
+}
+
+/// Wrap plain text to a display width. Explicit newlines are preserved and
+/// blank lines stay blank. Long words are split rather than overflowing.
+fn wrap_display(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for raw in text.split('\n') {
+        if raw.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let chars: Vec<char> = raw.chars().collect();
+        let mut start = 0;
+        while start < chars.len() {
+            let mut end = start;
+            let mut used = 0usize;
+            let mut last_space = None;
+            while end < chars.len() {
+                let w = UnicodeWidthChar::width(chars[end]).unwrap_or(0);
+                if used + w > width {
+                    break;
+                }
+                used += w;
+                if chars[end] == ' ' {
+                    last_space = Some(end);
+                }
+                end += 1;
+            }
+            if end == chars.len() {
+                out.push(chars[start..].iter().collect());
+                break;
+            }
+            if chars[end] == ' ' {
+                out.push(chars[start..end].iter().collect());
+                start = end + 1;
+            } else if let Some(space) = last_space.filter(|space| *space > start) {
+                out.push(chars[start..space].iter().collect());
+                start = space + 1;
+            } else {
+                let take = end.max(start + 1);
+                out.push(chars[start..take].iter().collect());
+                start = take;
+            }
+        }
+    }
+    out
+}
+
 fn ai_issue_line(issue: &ai::Issue, index: usize) -> String {
     let replacement = issue.replacement.as_deref().unwrap_or("(no auto-fix)");
     format!(
@@ -6670,5 +7296,70 @@ mod tests {
         assert_eq!(pick_status_clock(full, time, 4, 29), None);
         // A short left side leaves room for the full timestamp on 30 columns.
         assert_eq!(pick_status_clock(full, time, 4, 30), Some(full));
+    }
+
+    fn sample_ask_answer(status: AskStatus, answer: &str, message: &str) -> AskAnswer {
+        AskAnswer {
+            question: "Can he really drive that car?".to_string(),
+            scope: AskScope::Selection,
+            chapter: 2,
+            book_title: "My Book".to_string(),
+            chapter_heading: "3. The Garage".to_string(),
+            source: "He shifted into fourth.".to_string(),
+            status,
+            answer: answer.to_string(),
+            message: message.to_string(),
+            model: "test-model".to_string(),
+            scroll: 0,
+        }
+    }
+
+    #[test]
+    fn ask_buffer_shows_question_and_answer() {
+        let answer = sample_ask_answer(AskStatus::Ready, "Probably not at that speed.", "");
+        let lines = ask_buffer_lines(&answer, 60);
+        let text: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert!(text[0].contains("3. The Garage"));
+        assert!(text[0].contains("selection"));
+        assert!(text.contains(&"Q: Can he really drive that car?"));
+        assert!(text.contains(&"Probably not at that speed."));
+    }
+
+    #[test]
+    fn ask_buffer_shows_pending_and_error_messages() {
+        let pending = sample_ask_answer(AskStatus::Pending, "", "Asking the AI…");
+        let lines = ask_buffer_lines(&pending, 60);
+        assert!(lines.iter().any(|line| line.text == "Asking the AI…"));
+
+        let error = sample_ask_answer(AskStatus::Error, "", "network error: no route");
+        let lines = ask_buffer_lines(&error, 60);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text == "network error: no route")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text.contains("Press R to retry"))
+        );
+    }
+
+    #[test]
+    fn wrap_display_respects_width_and_blank_lines() {
+        assert_eq!(wrap_display("one two three", 7), vec!["one two", "three"]);
+        assert_eq!(wrap_display("a\n\nb", 5), vec!["a", "", "b"]);
+        assert_eq!(wrap_display("abcdef", 3), vec!["abc", "def"]);
+        assert_eq!(wrap_display("", 5), vec![""]);
+    }
+
+    #[test]
+    fn ask_prompt_label_offers_scope_toggle_only_with_a_selection() {
+        assert!(ask_prompt_label(AskScope::Selection, true).contains("Tab: chapter"));
+        assert!(ask_prompt_label(AskScope::Chapter, true).contains("Tab: selection"));
+        assert_eq!(
+            ask_prompt_label(AskScope::Chapter, false),
+            "Ask AI about chapter"
+        );
     }
 }
