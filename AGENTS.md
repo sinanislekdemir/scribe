@@ -31,6 +31,7 @@ build.rs          embeds the git tag / version into the binary
 src/model.rs      Book / Chapter / Para / styled characters, counts
 src/odt/mod.rs    ODT read/write, style resolution, unsupported-content refusal
 src/nextcloud.rs  WebDAV client and Nextcloud Login Flow v2
+src/spell.rs      Hunspell-backed Turkish spelling check
 src/lock.rs       sidecar file locks, kick protocol, lock watcher
 src/backups.rs    backup ring under ~/.cache/scribe/backups
 src/config.rs     credentials/config paths
@@ -119,6 +120,23 @@ scribe roundtrip in.odt out.odt
 - `R` retries from the stored `AskAnswer.source` snapshot, not from the current cursor, so a retry asks the same question about the same passage.
 - The ask prompt in `src/ai.rs` is plain text and must not be turned into the JSON copy-editor prompt. It answers questions and must not rewrite prose unless explicitly asked.
 - While `ask_view` is active, editing keys, search, and the menu are disabled; only scrolling, `R`, `Esc`/`F6`, and the global redraw/help/config keys run. `F6` and `F4` are handled before the answer-view handler.
+
+### Turkish spelling check (Hunspell)
+
+- `F5` (and `Tools → Check Turkish spelling…`) checks the **current chapter only** with the external `hunspell` binary. Do not check the whole book or switch the scope silently.
+- This is spelling, not grammar. It does not handle `de/da`, `ki`, `mi`, agreement, or punctuation; do not present it as a grammar checker.
+- There is no Rust Hunspell dependency and no bundled dictionary. The binary and `tr_TR` dictionary are external. Config lives in `~/.config/scribe/hunspell.toml`; `SCRIBE_HUNSPELL_BINARY` / `SCRIBE_HUNSPELL_DICTIONARY` override it. Never download or execute an unpinned dictionary from the TUI.
+- Run the check on a worker thread and report through the existing `AiEvent::SpellDone` channel. Never block the event loop or add an async runtime.
+- The panel reuses `AiPanel` with `PanelKind::Spell`. Keep AI state and spell state separate: `ai_job` and `spell_job` are distinct, and starting one cancels the other. Do not let a late result overwrite the other panel.
+- Suggestions are inert until the user presses Enter/A. That path calls `Editor::replace_span` with the exact stored `original` and the selected alternative, pushes a normal undo snapshot, and keeps the surrounding bold/italic intact. Never edit automatically.
+- Findings store **character** offsets for `replace_span`, not byte offsets. After applying one finding, shift the remaining findings in that paragraph by the replacement length difference and drop nothing else. Do not re-run the check on every accept.
+- Results carry the chapter index and paragraph text hash. Discard them when the chapter, document, or notes sidecar changes during the request. Clear the panel on file/notes switches.
+- The panel is modal while open: `Esc`/`F8` closes it, `R` re-checks, `D`/`X`/`Delete` dismisses, `U` appends to the user dictionary, `1`–`9` selects an alternative, `Enter`/`A` applies. Arrows move/scroll; `Ctrl+Z`/`Ctrl+Y` close the panel and undo/redo.
+- Fold Turkish circumflex vowels **for lookup only** (`â→a`, `î→i`, `û→u`) and keep the document spelling. The available `tr_TR` dictionaries omit circumflexes; without folding, correct `kâse` and `tezgâh` are false positives. This means a missing circumflex is not reported.
+- Default filtering: skip mid-sentence capitalized words (probable names) with `capitalized = "sentence"`; skip apostrophized tokens whose stem is capitalized (`Ankara'da`, `TÜBİTAK'ın`); skip words shorter than two characters, number-adjacent suffixes (`1923'te`), and user-dictionary words. Sentence-start names are still checked; `U` adds them.
+- The user dictionary is `~/.config/scribe/hunspell-words.txt`, one word per line, mode `0600`. `U` appends; never use the system clipboard.
+- Failures (missing binary, missing dictionary, parse error) are non-fatal and must never affect saving, locking, or the book model. Show them in the panel and keep the document usable.
+- `F5` is reserved for this check. `F8` remains the AI check; do not merge the two state machines.
 
 ### Nextcloud / networking
 

@@ -32,6 +32,7 @@ Built for a narrow document shape:
 - bold / italic / underline / strikethrough with real ODT character styles
 - a notes sidecar document (`.notes.odt`) toggled with `F7`
 - built-in case-insensitive find (`F3`) with no replace
+- local Turkish spelling check with Hunspell (`F5`) and a suggestions drawer
 - ask AI about a selection or chapter (`F4`) and read the answer in a temporary
   buffer toggled with `F6`
 
@@ -153,6 +154,7 @@ scribe --version
 |---|---|
 | `F9` | Open/close the top menu (arrows navigate, Enter runs) |
 | `F7` | Switch to/from the notes sidecar (creates it on first use) |
+| `F5` | Turkish spelling check for the current chapter (opens the suggestions panel) |
 | `F8` | AI writing check for the current chapter (opens the suggestions panel) |
 | `F4` | Ask AI a question about the selection or current chapter |
 | `F6` | Show/hide the temporary AI answer buffer |
@@ -270,6 +272,82 @@ memory while you switch; the inactive one is flushed to disk/Nextcloud.
 
 The status bar shows `NOTES` while the sidecar is open. Notes use the same
 formatting, AI check, autosave, and export features as the book.
+
+## Turkish spelling check
+
+`F5` (or `Tools → Check Turkish spelling…`) runs a local
+[Hunspell](https://hunspell.github.io/) check on the **current chapter** and
+opens a suggestions drawer above the status bar. Nothing is changed
+automatically: each suggestion must be applied explicitly, exactly like the AI
+check.
+
+Setup:
+
+```bash
+# Fedora
+sudo dnf install hunspell hunspell-tr
+
+# Debian / Ubuntu
+sudo apt install hunspell hunspell-tr
+```
+
+macOS does not ship the Turkish dictionary with Homebrew's `hunspell`. Install
+Hunspell and put the LibreOffice `tr_TR.aff` and `tr_TR.dic` files in a
+directory, then point scribe at the dictionary stem (no extension):
+
+```bash
+brew install hunspell
+mkdir -p ~/.local/share/scribe/hunspell
+# copy tr_TR.aff and tr_TR.dic there
+```
+
+`~/.config/scribe/hunspell.toml` is optional; the defaults are:
+
+```toml
+binary = "hunspell"
+dictionary = "tr_TR"          # or "~/.local/share/scribe/hunspell/tr_TR"
+capitalized = "sentence"      # all | sentence | none
+skip_apostrophe_names = true
+# ignore_file = "~/.config/scribe/hunspell-words.txt"
+```
+
+`SCRIBE_HUNSPELL_BINARY` and `SCRIBE_HUNSPELL_DICTIONARY` override the file at
+runtime. A leading `~/` is expanded in the binary and dictionary paths.
+
+On macOS, if scribe is launched from Finder instead of a terminal, the app may
+not inherit Homebrew's `PATH`. Use the absolute binary path in that case:
+`/usr/local/bin/hunspell` on Intel Macs or `/opt/homebrew/bin/hunspell` on Apple
+Silicon.
+
+In the panel:
+
+| Key | Action |
+|---|---|
+| `↑` / `↓`, `PgUp` / `PgDn`, `Home` / `End` | Move between suggestions |
+| `←` / `→` | Scroll a long suggestion row |
+| `1`–`9` | Choose an alternative |
+| `Enter` / `A` | Apply the selected suggestion (one undo step) |
+| `D` / `X` / `Delete` | Dismiss this finding |
+| `U` | Add the word to the user dictionary and dismiss it |
+| `R` | Check the chapter again |
+| `Esc` | Close the panel |
+
+The user dictionary is `~/.config/scribe/hunspell-words.txt`, one word per
+line. `U` appends to it with mode `0600`.
+
+To keep fiction usable, mid-sentence capitalized words are skipped by default
+(`capitalized = "sentence"`), so character and place names do not flood the
+panel. Apostrophized names such as `Ankara'da` and `TÜBİTAK'ın` are skipped when
+the stem is capitalized. A name at the start of a sentence is still checked; add
+it with `U`.
+
+Turkish circumflex vowels are folded for dictionary lookup (`â → a`, `î → i`,
+`û → u`), so correct `kâse` and `tezgâh` are not flagged even though the
+available `tr_TR` dictionaries use the unaccented forms. This also means a
+missing circumflex is not reported. The check is spelling only: it does not
+handle `de/da`, `ki`, `mi`, or other grammar.
+
+The check is local and offline; chapter text is never sent anywhere.
 
 ## AI writing check
 
@@ -449,6 +527,8 @@ Local-file saves back up on every successful local write. Remote saves back up a
 ```
 ~/.config/scribe/credentials.toml
 ~/.config/scribe/ai.toml
+~/.config/scribe/hunspell.toml
+~/.config/scribe/hunspell-words.txt
 ~/.config/scribe/settings.toml
 ~/.cache/scribe/files/<hash>.odt
 ~/.cache/scribe/files/<hash>.json
@@ -456,6 +536,7 @@ Local-file saves back up on every successful local write. Remote saves back up a
 
 `credentials.toml` contains the server URL, login name, generated app password, last folder, and last file.
 `ai.toml` (mode 0600) contains the OpenAI-compatible endpoint, model, API key, and language for the writing check; see [AI writing check](#ai-writing-check).
+`hunspell.toml` configures the local Turkish spelling check; `hunspell-words.txt` is its user dictionary. Both are optional; see [Turkish spelling check](#turkish-spelling-check).
 `settings.toml` (mode 0600) stores the selected UI theme; see [Themes](#themes).
 
 On the first run after the rename, `scribe` copies the old

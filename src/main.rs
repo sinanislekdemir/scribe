@@ -9,6 +9,7 @@ mod nextcloud;
 mod odt;
 mod search;
 mod settings;
+mod spell;
 mod theme;
 
 use std::io::{self, Write};
@@ -306,6 +307,8 @@ fn print_help() {
            scribe ai-config       configure the AI writing check\n\
            scribe ai-config --show  show the AI config (key masked)\n\
            scribe ai-config --test  test the AI endpoint\n\n\
-         Only .odt files are supported."
+         Only .odt files are supported.\n\
+         The Turkish spelling check (F5) uses the external hunspell binary\n\
+         and a tr_TR dictionary; see README for setup."
     );
 }

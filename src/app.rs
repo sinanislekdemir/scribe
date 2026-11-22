@@ -22,11 +22,12 @@ use crate::editor::{
     ClipText, Cursor, Editor, LineKind, MarkResult, smart_quote_for, smart_single_quote_for,
 };
 use crate::lock::{self, HeldLock, Identity, Kicker, LockEvent, LockHandle, LockInfo};
-use crate::model::{Align, Book, Chapter, ParaKind};
+use crate::model::{Align, Book, ParaKind};
 use crate::nextcloud::{Client, RemoteEntry};
 use crate::odt::OdtDocument;
 use crate::search::{self, SearchMatch};
 use crate::settings::{self, Settings};
+use crate::spell;
 use crate::theme::{Palette, ThemeName};
 
 const APP_AUTHOR: &str = env!("CARGO_PKG_AUTHORS");
@@ -314,6 +315,7 @@ enum MenuAction {
     Redraw,
     Help,
     AiCheck,
+    SpellCheck,
     AiAsk,
     AiAnswer,
     Config,
@@ -514,6 +516,11 @@ const MENUS: &[MenuDef] = &[
             },
             MenuEntry::Separator,
             MenuEntry::Item {
+                label: "Check Turkish spelling…",
+                shortcut: "F5",
+                action: MenuAction::SpellCheck,
+            },
+            MenuEntry::Item {
                 label: "Check writing (AI)…",
                 shortcut: "F8",
                 action: MenuAction::AiCheck,
@@ -656,6 +663,12 @@ enum AiEvent {
         job_id: u64,
         result: std::result::Result<String, String>,
     },
+    SpellDone {
+        job_id: u64,
+        chapter: usize,
+        text_hash: u64,
+        result: std::result::Result<Vec<spell::Finding>, String>,
+    },
     TestDone {
         result: std::result::Result<String, String>,
     },
@@ -674,11 +687,21 @@ enum AiStatus {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelKind {
+    Ai,
+    Spell,
+}
+
 struct AiPanel {
+    kind: PanelKind,
     chapter: usize,
     status: AiStatus,
     message: String,
     issues: Vec<ai::Issue>,
+    /// Alternatives parallel to `issues`; only the Hunspell panel fills this.
+    alternatives: Vec<Vec<String>>,
+    alt_selected: usize,
     selected: usize,
     progress_done: usize,
     progress_total: usize,
@@ -689,10 +712,13 @@ struct AiPanel {
 impl AiPanel {
     fn checking(chapter: usize, progress_total: usize, model: String) -> Self {
         Self {
+            kind: PanelKind::Ai,
             chapter,
             status: AiStatus::Checking,
             message: "Sending chapter to the AI…".to_string(),
             issues: Vec::new(),
+            alternatives: Vec::new(),
+            alt_selected: 0,
             selected: 0,
             progress_done: 0,
             progress_total,
@@ -701,17 +727,84 @@ impl AiPanel {
         }
     }
 
+    fn spell_checking(chapter: usize, dictionary: String) -> Self {
+        Self {
+            kind: PanelKind::Spell,
+            chapter,
+            status: AiStatus::Checking,
+            message: "Running hunspell…".to_string(),
+            issues: Vec::new(),
+            alternatives: Vec::new(),
+            alt_selected: 0,
+            selected: 0,
+            progress_done: 1,
+            progress_total: 1,
+            model: dictionary,
+            scroll: 0,
+        }
+    }
+
     fn error(chapter: usize, message: impl Into<String>) -> Self {
         Self {
+            kind: PanelKind::Ai,
             chapter,
             status: AiStatus::Error,
             message: message.into(),
             issues: Vec::new(),
+            alternatives: Vec::new(),
+            alt_selected: 0,
             selected: 0,
             progress_done: 0,
             progress_total: 0,
             model: String::new(),
             scroll: 0,
+        }
+    }
+
+    fn spell_error(chapter: usize, dictionary: String, message: impl Into<String>) -> Self {
+        Self {
+            kind: PanelKind::Spell,
+            chapter,
+            status: AiStatus::Error,
+            message: message.into(),
+            issues: Vec::new(),
+            alternatives: Vec::new(),
+            alt_selected: 0,
+            selected: 0,
+            progress_done: 1,
+            progress_total: 1,
+            model: dictionary,
+            scroll: 0,
+        }
+    }
+
+    fn is_spell(&self) -> bool {
+        self.kind == PanelKind::Spell
+    }
+
+    fn remove_issue(&mut self, index: usize) {
+        if index >= self.issues.len() {
+            return;
+        }
+        self.issues.remove(index);
+        if index < self.alternatives.len() {
+            self.alternatives.remove(index);
+        }
+        self.selected = self.selected.min(self.issues.len().saturating_sub(1));
+        self.alt_selected = 0;
+        self.scroll = 0;
+    }
+
+    fn selected_replacement(&self) -> Option<String> {
+        let issue = self.issues.get(self.selected)?;
+        if self.is_spell() {
+            self.alternatives
+                .get(self.selected)
+                .and_then(|alternatives| alternatives.get(self.alt_selected))
+                .cloned()
+                .or_else(|| issue.replacement.clone())
+        } else {
+            issue.replacement.clone()
         }
     }
 }
@@ -972,6 +1065,7 @@ pub struct App {
     ai_rx: Receiver<AiEvent>,
     ai_seq: u64,
     ai_job: Option<AiJob>,
+    spell_job: Option<AiJob>,
     ai_panel: Option<AiPanel>,
     ask: Option<AskAnswer>,
     ask_job: Option<u64>,
@@ -1048,6 +1142,7 @@ impl App {
             ai_rx,
             ai_seq: 0,
             ai_job: None,
+            spell_job: None,
             ai_panel: None,
             ask: None,
             ask_job: None,
@@ -1118,6 +1213,7 @@ impl App {
             ai_rx,
             ai_seq: 0,
             ai_job: None,
+            spell_job: None,
             ai_panel: None,
             ask: None,
             ask_job: None,
@@ -1230,6 +1326,9 @@ impl App {
         self.editor = Some(ed);
         self.search = SearchState::default();
         self.clear_ai_answer();
+        self.ai_panel = None;
+        self.ai_job = None;
+        self.spell_job = None;
         self.overlay = Overlay::None;
         self.file_picker = None;
         self.chapter_picker = None;
@@ -2295,6 +2394,15 @@ impl App {
             }
             return;
         }
+        if key.code == KeyCode::F(5) {
+            if !self.ask_view {
+                match self.overlay {
+                    Overlay::None | Overlay::AiPanel => self.action_spell_check(),
+                    _ => {}
+                }
+            }
+            return;
+        }
         if key.code == KeyCode::F(4) {
             match self.overlay {
                 Overlay::None | Overlay::Selection => self.action_ai_ask(),
@@ -2545,6 +2653,7 @@ impl App {
             | MenuAction::About => true,
             MenuAction::Open => self.client.is_some(),
             MenuAction::AiCheck => self.editor.is_some(),
+            MenuAction::SpellCheck => self.editor.is_some(),
             MenuAction::AiAsk => self.editor.is_some(),
             MenuAction::AiAnswer => self.editor.is_some() && self.ask.is_some(),
             MenuAction::Notes => self.editor.is_some() && !self.notes_loading,
@@ -2668,6 +2777,7 @@ impl App {
             MenuAction::Redraw => self.action_redraw(),
             MenuAction::Help => self.action_help(),
             MenuAction::AiCheck => self.action_ai_check(),
+            MenuAction::SpellCheck => self.action_spell_check(),
             MenuAction::AiAsk => self.action_ai_ask(),
             MenuAction::AiAnswer => self.toggle_ai_answer(),
             MenuAction::Config => self.action_config(),
@@ -3183,6 +3293,7 @@ impl App {
         }
         self.search = SearchState::default();
         self.clear_ai_answer();
+        self.close_ai_panel();
         if self.notes_active {
             self.leave_notes();
         } else {
@@ -3663,6 +3774,7 @@ impl App {
 
     fn action_ai_check(&mut self) {
         self.ask_view = false;
+        self.spell_job = None;
         let Some(ed) = &self.editor else {
             return;
         };
@@ -3735,9 +3847,89 @@ impl App {
     fn close_ai_panel(&mut self) {
         self.ai_panel = None;
         self.ai_job = None;
+        self.spell_job = None;
         if self.overlay == Overlay::AiPanel {
             self.overlay = Overlay::None;
         }
+    }
+
+    fn action_spell_check(&mut self) {
+        self.ask_view = false;
+        self.ai_job = None;
+        let Some(ed) = &self.editor else {
+            return;
+        };
+        let chapter = ed.current_chapter();
+        let paragraphs = ed.chapter_texts(chapter);
+        if paragraphs.iter().all(|p| p.trim().is_empty()) {
+            self.toast("This chapter is empty.");
+            return;
+        }
+
+        let cfg = match spell::load() {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                self.ai_panel = Some(AiPanel::spell_error(
+                    chapter,
+                    "hunspell".to_string(),
+                    format!("Hunspell config error: {error}"),
+                ));
+                self.spell_job = None;
+                self.overlay = Overlay::AiPanel;
+                self.toast("Hunspell configuration error.");
+                return;
+            }
+        };
+        if let Err(error) = cfg.validate() {
+            self.ai_panel = Some(AiPanel::spell_error(
+                chapter,
+                cfg.display_dictionary(),
+                format!("Hunspell config error: {error}"),
+            ));
+            self.spell_job = None;
+            self.overlay = Overlay::AiPanel;
+            self.toast("Hunspell configuration error.");
+            return;
+        }
+        let ignored = match spell::load_ignored(&cfg) {
+            Ok(words) => words,
+            Err(error) => {
+                self.ai_panel = Some(AiPanel::spell_error(
+                    chapter,
+                    cfg.display_dictionary(),
+                    format!("Could not read the ignored-word list: {error}"),
+                ));
+                self.spell_job = None;
+                self.overlay = Overlay::AiPanel;
+                self.toast("Could not read the ignored-word list.");
+                return;
+            }
+        };
+
+        self.ai_seq = self.ai_seq.wrapping_add(1);
+        let job_id = self.ai_seq;
+        let text_hash = text_hash(&paragraphs);
+        self.spell_job = Some(AiJob {
+            id: job_id,
+            chapter,
+            text_hash,
+        });
+        let dictionary = cfg.display_dictionary();
+        self.ai_panel = Some(AiPanel::spell_checking(chapter, dictionary));
+        self.overlay = Overlay::AiPanel;
+        self.toast("Checking Turkish spelling with hunspell…");
+
+        let tx = self.ai_tx.clone();
+        std::thread::spawn(move || {
+            let result = spell::check_chapter(&cfg, &paragraphs, &ignored)
+                .map_err(|error| format!("{error}"));
+            let _ = tx.send(AiEvent::SpellDone {
+                job_id,
+                chapter,
+                text_hash,
+                result,
+            });
+        });
     }
 
     fn ai_ready(&mut self) -> bool {
@@ -4078,6 +4270,8 @@ impl App {
                                 panel.progress_done = panel.progress_total;
                                 panel.selected = 0;
                                 panel.scroll = 0;
+                                panel.alternatives.clear();
+                                panel.alt_selected = 0;
                                 panel.issues = issues;
                                 panel.message = if count == 0 {
                                     "No issues found.".to_string()
@@ -4093,6 +4287,8 @@ impl App {
                                 panel.status = AiStatus::Error;
                                 panel.message = error;
                                 panel.issues.clear();
+                                panel.alternatives.clear();
+                                panel.alt_selected = 0;
                             }
                             self.toast("AI check failed.");
                         }
@@ -4122,6 +4318,97 @@ impl App {
                             answer.status = AskStatus::Error;
                             answer.message = error;
                             self.toast("AI request failed.");
+                        }
+                    }
+                }
+                AiEvent::SpellDone {
+                    job_id,
+                    chapter,
+                    text_hash: expected_hash,
+                    result,
+                } => {
+                    let Some(job) = &self.spell_job else {
+                        continue;
+                    };
+                    if job.id != job_id || job.chapter != chapter || job.text_hash != expected_hash
+                    {
+                        continue;
+                    }
+                    self.spell_job = None;
+
+                    let Some(ed) = &self.editor else {
+                        self.ai_panel = None;
+                        self.overlay = Overlay::None;
+                        continue;
+                    };
+                    if ed.current_chapter() != chapter {
+                        self.ai_panel = None;
+                        self.overlay = Overlay::None;
+                        self.toast("Chapter changed; Turkish check discarded.");
+                        continue;
+                    }
+                    if text_hash(&ed.chapter_texts(chapter)) != expected_hash {
+                        if let Some(panel) = &mut self.ai_panel {
+                            panel.status = AiStatus::Error;
+                            panel.message =
+                                "Chapter changed during the check. Press R to run again."
+                                    .to_string();
+                            panel.issues.clear();
+                            panel.alternatives.clear();
+                            panel.alt_selected = 0;
+                        }
+                        self.toast("Chapter changed during check; run again.");
+                        continue;
+                    }
+
+                    match result {
+                        Ok(findings) => {
+                            let count = findings.len();
+                            let mut issues = Vec::with_capacity(count);
+                            let mut alternatives = Vec::with_capacity(count);
+                            for finding in findings {
+                                alternatives.push(finding.alternatives.clone());
+                                issues.push(ai::Issue {
+                                    para: finding.para,
+                                    start: finding.start,
+                                    end: finding.end,
+                                    original: finding.original,
+                                    replacement: finding.alternatives.first().cloned(),
+                                    kind: "spelling".to_string(),
+                                    severity: "warning".to_string(),
+                                    message: finding.message,
+                                });
+                            }
+                            if let Some(panel) = &mut self.ai_panel {
+                                panel.status = AiStatus::Ready;
+                                panel.progress_done = panel.progress_total;
+                                panel.selected = 0;
+                                panel.alt_selected = 0;
+                                panel.scroll = 0;
+                                panel.issues = issues;
+                                panel.alternatives = alternatives;
+                                panel.message = if count == 0 {
+                                    "No Turkish spelling issues found.".to_string()
+                                } else {
+                                    format!("{count} spelling suggestion(s).")
+                                };
+                            }
+                            self.reveal_ai_selection();
+                            self.toast(if count == 0 {
+                                "No Turkish spelling issues found."
+                            } else {
+                                "Turkish spelling check complete."
+                            });
+                        }
+                        Err(error) => {
+                            if let Some(panel) = &mut self.ai_panel {
+                                panel.status = AiStatus::Error;
+                                panel.message = error;
+                                panel.issues.clear();
+                                panel.alternatives.clear();
+                                panel.alt_selected = 0;
+                            }
+                            self.toast("Turkish spelling check failed.");
                         }
                     }
                 }
@@ -4229,17 +4516,26 @@ impl App {
     }
 
     fn handle_ai_panel_key(&mut self, key: KeyEvent) {
+        let is_spell = self.ai_panel.as_ref().is_some_and(AiPanel::is_spell);
         match key.code {
             KeyCode::Esc => self.close_ai_panel(),
             KeyCode::Char('z') if ctrl(&key) => {
                 self.action_undo();
                 self.close_ai_panel();
-                self.toast("Undone. Press F8 to check again.");
+                self.toast(if is_spell {
+                    "Undone. Press F5 to check again."
+                } else {
+                    "Undone. Press F8 to check again."
+                });
             }
             KeyCode::Char('y') if ctrl(&key) => {
                 self.action_redo();
                 self.close_ai_panel();
-                self.toast("Redone. Press F8 to check again.");
+                self.toast(if is_spell {
+                    "Redone. Press F5 to check again."
+                } else {
+                    "Redone. Press F8 to check again."
+                });
             }
             KeyCode::Up => self.ai_move(-1),
             KeyCode::Down => self.ai_move(1),
@@ -4258,9 +4554,83 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char('a') => self.apply_selected_ai(),
             KeyCode::Char('d') | KeyCode::Char('x') | KeyCode::Delete => self.dismiss_selected_ai(),
-            KeyCode::Char('r') | KeyCode::Char('R') => self.action_ai_check(),
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if is_spell {
+                    self.action_spell_check();
+                } else {
+                    self.action_ai_check();
+                }
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') if is_spell => {
+                self.add_selected_spell_word();
+            }
+            KeyCode::Char(digit @ '1'..='9') if is_spell => {
+                self.select_spell_alternative(digit);
+            }
             _ => {}
         }
+    }
+
+    fn select_spell_alternative(&mut self, digit: char) {
+        let Some(index) = digit.to_digit(10).map(|n| n as usize) else {
+            return;
+        };
+        let Some(panel) = &mut self.ai_panel else {
+            return;
+        };
+        if !panel.is_spell() || index == 0 {
+            return;
+        }
+        let count = panel
+            .alternatives
+            .get(panel.selected)
+            .map(Vec::len)
+            .unwrap_or(0);
+        if index <= count {
+            panel.alt_selected = index - 1;
+            panel.scroll = 0;
+        }
+    }
+
+    fn add_selected_spell_word(&mut self) {
+        let Some(panel) = &self.ai_panel else {
+            return;
+        };
+        if !panel.is_spell() || panel.status != AiStatus::Ready {
+            return;
+        }
+        let Some(issue) = panel.issues.get(panel.selected).cloned() else {
+            return;
+        };
+        let cfg = match spell::load() {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                self.toast(format!("Hunspell config error: {error}"));
+                return;
+            }
+        };
+        if let Err(error) = spell::add_word(&cfg, &issue.original) {
+            self.toast(format!("Could not add the word: {error}"));
+            return;
+        }
+        let word = issue.original;
+        if let Some(panel) = &mut self.ai_panel {
+            let mut index = 0;
+            while index < panel.issues.len() {
+                if panel.issues[index].original == word {
+                    panel.remove_issue(index);
+                } else {
+                    index += 1;
+                }
+            }
+            panel.message = if panel.issues.is_empty() {
+                "No spelling issues left.".to_string()
+            } else {
+                format!("{} spelling suggestion(s) left.", panel.issues.len())
+            };
+        }
+        self.reveal_ai_selection();
+        self.toast("Added to the user dictionary.");
     }
 
     fn ai_move(&mut self, delta: isize) {
@@ -4281,6 +4651,7 @@ impl App {
                 return;
             }
             panel.selected = index.min(panel.issues.len() - 1);
+            panel.alt_selected = 0;
             panel.scroll = 0;
         }
         self.reveal_ai_selection();
@@ -4296,7 +4667,15 @@ impl App {
         let Some(issue) = panel.issues.get(panel.selected) else {
             return;
         };
-        let content = ai_issue_line(issue, panel.selected);
+        let content = if panel.is_spell() {
+            spell_issue_line(
+                issue,
+                panel.alternatives.get(panel.selected).map(Vec::as_slice),
+                panel.alt_selected,
+            )
+        } else {
+            ai_issue_line(issue, panel.selected)
+        };
         let width = crossterm::terminal::size()
             .map(|(width, _)| width as usize)
             .unwrap_or(120)
@@ -4314,11 +4693,16 @@ impl App {
         }
         let chapter = panel.chapter;
         let selected = panel.selected;
+        let is_spell = panel.is_spell();
         let Some(issue) = panel.issues.get(selected).cloned() else {
             return;
         };
-        let Some(replacement) = issue.replacement.clone() else {
-            self.toast("No automatic fix for this suggestion; dismiss it instead.");
+        let Some(replacement) = panel.selected_replacement() else {
+            if is_spell {
+                self.toast("No suggestion for this word; dismiss with D or add it with U.");
+            } else {
+                self.toast("No automatic fix for this suggestion; dismiss it instead.");
+            }
             return;
         };
 
@@ -4337,17 +4721,22 @@ impl App {
             &replacement,
         );
         let paragraphs = ed.chapter_texts(chapter);
+        let delta = replacement.chars().count() as isize - issue.original.chars().count() as isize;
 
         if !applied {
             if let Some(panel) = &mut self.ai_panel {
-                panel.issues.retain(|item| {
-                    !(item.para == issue.para
-                        && item.original == issue.original
-                        && item.replacement == issue.replacement)
-                });
-                ai::reanchor(&mut panel.issues, &paragraphs);
-                panel.selected = panel.selected.min(panel.issues.len().saturating_sub(1));
-                panel.scroll = 0;
+                if is_spell {
+                    panel.remove_issue(selected);
+                } else {
+                    panel.issues.retain(|item| {
+                        !(item.para == issue.para
+                            && item.original == issue.original
+                            && item.replacement == issue.replacement)
+                    });
+                    ai::reanchor(&mut panel.issues, &paragraphs);
+                    panel.selected = panel.selected.min(panel.issues.len().saturating_sub(1));
+                    panel.scroll = 0;
+                }
                 panel.message = "Suggestion no longer matches the text.".to_string();
             }
             self.toast("Suggestion is stale; run the check again.");
@@ -4357,12 +4746,20 @@ impl App {
         self.last_edit = Instant::now();
         self.save_state = SaveState::Idle;
         if let Some(panel) = &mut self.ai_panel {
-            panel.issues.remove(selected);
-            ai::reanchor(&mut panel.issues, &paragraphs);
-            panel.selected = panel.selected.min(panel.issues.len().saturating_sub(1));
-            panel.scroll = 0;
+            panel.remove_issue(selected);
+            if is_spell {
+                shift_spell_offsets(&mut panel.issues, issue.para, issue.end, delta);
+            } else {
+                ai::reanchor(&mut panel.issues, &paragraphs);
+            }
             panel.message = if panel.issues.is_empty() {
-                "All suggestions handled.".to_string()
+                if is_spell {
+                    "All spelling issues handled.".to_string()
+                } else {
+                    "All suggestions handled.".to_string()
+                }
+            } else if is_spell {
+                format!("{} spelling suggestion(s) left.", panel.issues.len())
             } else {
                 format!("{} suggestion(s) left.", panel.issues.len())
             };
@@ -4378,11 +4775,12 @@ impl App {
         if panel.status != AiStatus::Ready || panel.issues.is_empty() {
             return;
         }
-        panel.issues.remove(panel.selected);
-        panel.selected = panel.selected.min(panel.issues.len().saturating_sub(1));
-        panel.scroll = 0;
+        let is_spell = panel.is_spell();
+        panel.remove_issue(panel.selected);
         panel.message = if panel.issues.is_empty() {
             "No suggestions left.".to_string()
+        } else if is_spell {
+            format!("{} spelling suggestion(s) left.", panel.issues.len())
         } else {
             format!("{} suggestion(s) left.", panel.issues.len())
         };
@@ -5093,21 +5491,40 @@ impl App {
             buf[(x, rect.y)].set_style(Style::default().bg(p.panel_bg).fg(p.page_border));
         }
 
-        let header = match panel.status {
-            AiStatus::Checking => format!(
-                " AI check · chapter {} · {}/{} · {} ",
-                panel.chapter + 1,
-                panel.progress_done.max(1),
-                panel.progress_total.max(1),
-                panel.model
-            ),
-            AiStatus::Ready => format!(
-                " AI check · chapter {} · {} suggestion(s) · {} ",
-                panel.chapter + 1,
-                panel.issues.len(),
-                panel.model
-            ),
-            AiStatus::Error => format!(" AI check · chapter {} · error ", panel.chapter + 1),
+        let header = if panel.is_spell() {
+            match panel.status {
+                AiStatus::Checking => format!(
+                    " Turkish check · chapter {} · checking · {} ",
+                    panel.chapter + 1,
+                    panel.model
+                ),
+                AiStatus::Ready => format!(
+                    " Turkish check · chapter {} · {} suggestion(s) · {} ",
+                    panel.chapter + 1,
+                    panel.issues.len(),
+                    panel.model
+                ),
+                AiStatus::Error => {
+                    format!(" Turkish check · chapter {} · error ", panel.chapter + 1)
+                }
+            }
+        } else {
+            match panel.status {
+                AiStatus::Checking => format!(
+                    " AI check · chapter {} · {}/{} · {} ",
+                    panel.chapter + 1,
+                    panel.progress_done.max(1),
+                    panel.progress_total.max(1),
+                    panel.model
+                ),
+                AiStatus::Ready => format!(
+                    " AI check · chapter {} · {} suggestion(s) · {} ",
+                    panel.chapter + 1,
+                    panel.issues.len(),
+                    panel.model
+                ),
+                AiStatus::Error => format!(" AI check · chapter {} · error ", panel.chapter + 1),
+            }
         };
         buf.set_stringn(
             rect.x,
@@ -5126,13 +5543,26 @@ impl App {
         let footer_y = rect.y + rect.height - 1;
         let detail_rows = 2u16.min(rect.height.saturating_sub(3));
         let detail_y = footer_y.saturating_sub(detail_rows);
-        let footer = match panel.status {
-            AiStatus::Checking => " Esc cancel · check again with R",
-            AiStatus::Error => " R retry · Esc close",
-            AiStatus::Ready if rect.width >= 95 => {
-                " ↑↓ move · ←→ scroll · Enter apply · D dismiss · R re-check · Esc close"
+        let footer = if panel.is_spell() {
+            match panel.status {
+                AiStatus::Checking => " Esc cancel · check again with R",
+                AiStatus::Error => " R retry · Esc close",
+                AiStatus::Ready if rect.width >= 110 => {
+                    " ↑↓ move · ←→ scroll · 1–9 choose · Enter apply · U add word · D dismiss · R re-check · Esc close"
+                }
+                AiStatus::Ready => {
+                    " ↑↓ ←→ · 1–9 · Enter apply · U add · D dismiss · R recheck · Esc"
+                }
             }
-            AiStatus::Ready => " ↑↓ ←→ move/scroll · Enter apply · D dismiss · R recheck · Esc",
+        } else {
+            match panel.status {
+                AiStatus::Checking => " Esc cancel · check again with R",
+                AiStatus::Error => " R retry · Esc close",
+                AiStatus::Ready if rect.width >= 95 => {
+                    " ↑↓ move · ←→ scroll · Enter apply · D dismiss · R re-check · Esc close"
+                }
+                AiStatus::Ready => " ↑↓ ←→ move/scroll · Enter apply · D dismiss · R recheck · Esc",
+            }
         };
         buf.set_stringn(
             rect.x,
@@ -5199,7 +5629,19 @@ impl App {
                 buf[(x, y)].set_style(style);
             }
             let prefix = if selected { "▶ " } else { "  " };
-            let content = ai_issue_line(issue, index);
+            let content = if panel.is_spell() {
+                spell_issue_line(
+                    issue,
+                    panel.alternatives.get(index).map(Vec::as_slice),
+                    if selected {
+                        panel.alt_selected
+                    } else {
+                        usize::MAX
+                    },
+                )
+            } else {
+                ai_issue_line(issue, index)
+            };
             let visible = if selected {
                 let max_scroll =
                     text_width(&content).saturating_sub(rect.width.saturating_sub(3) as usize);
@@ -5225,7 +5667,27 @@ impl App {
             .issues
             .get(panel.selected)
             .map(|issue| {
-                if issue.message.is_empty() {
+                if panel.is_spell() {
+                    let selected = panel
+                        .alternatives
+                        .get(panel.selected)
+                        .and_then(|alternatives| alternatives.get(panel.alt_selected));
+                    match selected {
+                        Some(alternative) => format!(
+                            "{} of {} · {} Selected: {}",
+                            panel.selected + 1,
+                            panel.issues.len(),
+                            issue.message,
+                            alternative
+                        ),
+                        None => format!(
+                            "{} of {} · {}",
+                            panel.selected + 1,
+                            panel.issues.len(),
+                            issue.message
+                        ),
+                    }
+                } else if issue.message.is_empty() {
                     format!("{} of {}", panel.selected + 1, panel.issues.len())
                 } else {
                     format!("{}: {}", panel.selected + 1, issue.message)
@@ -6167,7 +6629,7 @@ impl App {
     fn draw_help(&self, frame: &mut Frame) {
         let p = self.palette;
         let area = frame.area();
-        let rect = centered(area, 76.min(area.width), 34.min(area.height));
+        let rect = centered(area, 76.min(area.width), 35.min(area.height));
         frame.render_widget(Clear, rect);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -6214,9 +6676,9 @@ impl App {
             )),
             Line::from("Ctrl+O open from Nextcloud   Ctrl+S save now"),
             Line::from("F3 find                      Ctrl+, configuration"),
-            Line::from("F7 notes sidecar             F8 AI writing check"),
+            Line::from("F5 Turkish spelling          F8 AI writing check"),
             Line::from("F4 ask AI                    F6 show/hide AI answer"),
-            Line::from("F9 menu bar · themes: Tools → Configuration"),
+            Line::from("F7 notes sidecar             F9 menu bar · themes"),
             Line::from("Alt+H help / Alt+A about    PgUp/PgDn page"),
             Line::from("Ctrl+Home/End chapter start/end"),
             Line::from("Ctrl+L full redraw            Ctrl+Q quit"),
@@ -7051,6 +7513,45 @@ fn ai_issue_line(issue: &ai::Issue, index: usize) -> String {
     )
 }
 
+fn spell_issue_line(
+    issue: &ai::Issue,
+    alternatives: Option<&[String]>,
+    alt_selected: usize,
+) -> String {
+    let Some(alternatives) = alternatives else {
+        return format!("{} — no suggestion", issue.original);
+    };
+    if alternatives.is_empty() {
+        return format!("{} — no suggestion", issue.original);
+    }
+    let mut line = format!("{} →", issue.original);
+    for (index, alternative) in alternatives.iter().enumerate() {
+        line.push_str(if index == 0 { " " } else { "  " });
+        if index == alt_selected {
+            line.push('[');
+        }
+        line.push_str(&format!("{}. {alternative}", index + 1));
+        if index == alt_selected {
+            line.push(']');
+        }
+    }
+    line
+}
+
+/// Keep the remaining Hunspell findings anchored after one replacement.
+/// Tokens do not overlap, so only findings at or after `after` move.
+fn shift_spell_offsets(issues: &mut [ai::Issue], para: usize, after: usize, delta: isize) {
+    if delta == 0 {
+        return;
+    }
+    for issue in issues {
+        if issue.para == para && issue.start >= after {
+            issue.start = issue.start.saturating_add_signed(delta);
+            issue.end = issue.end.saturating_add_signed(delta);
+        }
+    }
+}
+
 /// Show a horizontal window into `text`, using `…` at the clipped edges.
 fn scroll_text(text: &str, skip: usize, max_width: usize) -> String {
     if max_width == 0 {
@@ -7136,6 +7637,7 @@ fn _unused(_: &Book, _: &Buffer) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Chapter;
 
     fn item(action: MenuAction) -> MenuEntry {
         MenuEntry::Item {
@@ -7361,5 +7863,59 @@ mod tests {
             ask_prompt_label(AskScope::Chapter, false),
             "Ask AI about chapter"
         );
+    }
+
+    fn spell_issue(para: usize, start: usize, end: usize, word: &str) -> ai::Issue {
+        ai::Issue {
+            para,
+            start,
+            end,
+            original: word.to_string(),
+            replacement: None,
+            kind: "spelling".to_string(),
+            severity: "warning".to_string(),
+            message: "Not in the Turkish dictionary.".to_string(),
+        }
+    }
+
+    #[test]
+    fn spell_line_marks_the_selected_alternative() {
+        let issue = spell_issue(0, 4, 11, "kitapda");
+        let alternatives = vec!["kitapta".to_string(), "kitapla".to_string()];
+        let line = spell_issue_line(&issue, Some(&alternatives), 1);
+        assert!(line.contains("1. kitapta"));
+        assert!(line.contains("[2. kitapla]"));
+        assert!(!line.contains("[1. kitapta]"));
+    }
+
+    #[test]
+    fn spell_line_reports_when_there_is_no_suggestion() {
+        let issue = spell_issue(0, 0, 3, "abc");
+        let line = spell_issue_line(&issue, Some(&[]), 0);
+        assert_eq!(line, "abc — no suggestion");
+    }
+
+    #[test]
+    fn shifting_spell_offsets_moves_only_the_same_paragraph_after_the_edit() {
+        let mut issues = vec![
+            spell_issue(0, 0, 3, "one"),
+            spell_issue(0, 10, 15, "two"),
+            spell_issue(1, 10, 15, "three"),
+        ];
+        shift_spell_offsets(&mut issues, 0, 7, -2);
+        assert_eq!((issues[0].start, issues[0].end), (0, 3));
+        assert_eq!((issues[1].start, issues[1].end), (8, 13));
+        assert_eq!((issues[2].start, issues[2].end), (10, 15));
+    }
+
+    #[test]
+    fn removing_a_spell_issue_keeps_alternatives_aligned() {
+        let mut panel = AiPanel::spell_checking(0, "tr_TR".to_string());
+        panel.issues = vec![spell_issue(0, 0, 3, "one"), spell_issue(0, 4, 7, "two")];
+        panel.alternatives = vec![vec!["first".to_string()], vec!["second".to_string()]];
+        panel.remove_issue(0);
+        assert_eq!(panel.issues.len(), 1);
+        assert_eq!(panel.issues[0].original, "two");
+        assert_eq!(panel.alternatives, vec![vec!["second".to_string()]]);
     }
 }
