@@ -1084,8 +1084,10 @@ impl Editor {
     /// True when the insertion point begins a sentence: at a paragraph start,
     /// or after `.`, `!`, `?` followed by whitespace. Opening quotes and
     /// brackets before the insertion point are looked through, and closing
-    /// ones after the punctuation are skipped. A selection is replaced at its
-    /// start, so that position is used instead.
+    /// ones after the punctuation are skipped. A closing double quote (`”`)
+    /// suppresses the rule, because the following word often continues the
+    /// same sentence (`“orada mısın?” diye sordu`). A selection is replaced at
+    /// its start, so that position is used instead.
     fn at_sentence_start(&self) -> bool {
         let (para, offset) = match self.selection_bounds() {
             Some((start, _)) => (start.para, start.offset),
@@ -1113,6 +1115,9 @@ impl Editor {
             if i == before {
                 break;
             }
+        }
+        if i > 0 && chars[i - 1].ch == '”' {
+            return false;
         }
         if i == 0 {
             return true;
@@ -2192,7 +2197,7 @@ mod tests {
         }
         assert_eq!(
             ed.doc.book.chapters[0].paragraphs[0].text(),
-            "He said “stop.” Then"
+            "He said “stop.” then"
         );
 
         let doc = OdtDocument::new("Test").unwrap();
@@ -2216,6 +2221,19 @@ mod tests {
         }
         assert_eq!(ed.doc.book.chapters[0].paragraphs[0].text(), "Hello");
         assert_eq!(ed.doc.book.chapters[0].paragraphs[1].text(), "World");
+    }
+
+    #[test]
+    fn does_not_autocapitalize_after_closing_double_quote() {
+        let doc = OdtDocument::new("Test").unwrap();
+        let mut ed = Editor::new(doc, 80, 24);
+        for ch in "\"aras, orada mısın?\" diye sordu".chars() {
+            ed.insert_typed_char(ch);
+        }
+        assert_eq!(
+            ed.doc.book.chapters[0].paragraphs[0].text(),
+            "“Aras, orada mısın?” diye sordu"
+        );
     }
 
     #[test]

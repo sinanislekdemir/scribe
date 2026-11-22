@@ -85,7 +85,7 @@ scribe roundtrip in.odt out.odt
 - Nextcloud is optional. `scribe open FILE.odt` and `scribe FILE.odt` must never require credentials. With no saved credentials, the no-argument first-run menu offers Nextcloud login, a local `.odt`, and quit; do not force Nextcloud login.
 - Italic is `Alt+I`; most terminals send `Ctrl+I` as Tab. Bold is `Ctrl+B` or `Alt+B`.
 - Smart quotes apply only to **typed** characters via `insert_typed_char`. `insert_text` (paste) must not convert quotes.
-- Auto-capitalization also applies only to **typed** characters. A lowercase letter is uppercased at a paragraph start or after `.`, `!`, or `?` plus whitespace, looking through opening quotes/brackets; pasted text is never rewritten. Turkish dotted `i` uppercases to `İ`, not ASCII `I`.
+- Auto-capitalization also applies only to **typed** characters. A lowercase letter is uppercased at a paragraph start or after `.`, `!`, or `?` plus whitespace, looking through opening quotes/brackets; pasted text is never rewritten. A closing `”` suppresses it, because the next word usually continues the sentence (`“orada mısın?” diye sordu`). Turkish dotted `i` uppercases to `İ`, not ASCII `I`.
 - Consecutive typing is grouped into word-sized undo steps: do not restore a snapshot per keystroke. `insert_char` starts a new step after a cursor move, a selection replacement, or at the start of a new word; newline and paste stay separate steps.
   - Opening `"` → `“`, opening `'` → `‘` at start/after whitespace/after `( [ { — – / \ |`.
   - Everything else closes: `”` / `’`, including after comma, period, `!`, `?`, `)`, and inside words (`Anette’nin`).
