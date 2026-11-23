@@ -472,6 +472,24 @@ impl Editor {
         self.total_chars = self.doc.book.total_chars();
     }
 
+    /// Dialogue share of the body text in the current chapter and in the whole
+    /// book, as rounded whole percentages. Dialogue is the text inside `“…”`
+    /// or an ASCII `"…"` pair; titles and subheadings are not counted.
+    pub fn dialogue_ratios(&self) -> (usize, usize) {
+        let chapter = self
+            .doc
+            .book
+            .chapters
+            .get(self.cursor.chapter)
+            .map(|c| c.dialogue_word_counts())
+            .unwrap_or((0, 0));
+        let book = self.doc.book.dialogue_word_counts();
+        (
+            word_percent(chapter.1, chapter.0 + chapter.1),
+            word_percent(book.1, book.0 + book.1),
+        )
+    }
+
     fn para_len_at(&self, para: usize) -> usize {
         self.doc.book.chapters[self.cursor.chapter]
             .paragraphs
@@ -1620,6 +1638,12 @@ fn is_closing_punct(c: char) -> bool {
     )
 }
 
+/// `part / total` as a rounded whole percentage; zero when there is nothing to
+/// measure.
+fn word_percent(part: usize, total: usize) -> usize {
+    (part * 100 + total / 2).checked_div(total).unwrap_or(0)
+}
+
 /// Keep the cursor visible while scrolling in 75% steps, retaining the last
 /// 25% of the previous viewport above the cursor.
 fn scrolled_view_start(line: usize, view_start: usize, page_height: usize) -> usize {
@@ -1766,6 +1790,20 @@ mod tests {
         ed.undo();
         assert_eq!(ed.doc.book.chapters[0].paragraphs.len(), 1);
         assert_eq!(ed.doc.book.chapters[0].paragraphs[0].text(), "Hello");
+    }
+
+    #[test]
+    fn dialogue_ratios_compare_chapter_and_book() {
+        let doc = OdtDocument::new("Test").unwrap();
+        let mut ed = Editor::new(doc, 80, 24);
+        ed.insert_text("“bir iki üç” dört beş");
+        assert_eq!(ed.dialogue_ratios(), (60, 60));
+
+        ed.create_chapter("İki".to_string());
+        ed.insert_text("altı yedi");
+        assert_eq!(ed.dialogue_ratios(), (0, 43));
+        ed.goto_chapter(0);
+        assert_eq!(ed.dialogue_ratios(), (60, 43));
     }
 
     #[test]

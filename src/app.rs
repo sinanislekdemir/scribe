@@ -6496,6 +6496,12 @@ impl App {
                 format!("{} pages", fmt_num(ed.total_pages)),
                 Style::default().fg(p.plain),
             ));
+            let (chapter_tdr, book_tdr) = ed.dialogue_ratios();
+            spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
+            spans.push(Span::styled(
+                format!("[TDR: {chapter_tdr}%/{book_tdr}%]"),
+                Style::default().fg(p.plain),
+            ));
             spans.push(Span::styled("  │  ", Style::default().fg(p.dim)));
             spans.push(Span::styled(
                 format!(

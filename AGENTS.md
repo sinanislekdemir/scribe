@@ -92,6 +92,7 @@ scribe roundtrip in.odt out.odt
   - Chapter/book title prompts use smart quotes; file-name prompts do not.
 - Bold/italic toggles the word under the cursor, or sets pending style for the next text. `B*` / `I*` in the status bar means pending.
 - Status bar totals include the book title, chapter titles, and body. Page counts are **terminal pages**, not printed ODT pages.
+- `[TDR: ch%/book%]` is the dialogue share of body words (inside `“…”` or an ASCII `"…"` pair) for the current chapter and the whole book. The book title, chapter titles, and H3 subheadings are excluded from both numerator and denominator; the quote state carries across paragraphs within a chapter, and single quotes are not dialogue. It is a text statistic, not a page/print measure.
 - The status bar shows the local **date and time** (`YYYY-MM-DD HH:MM`) right-aligned when it fits beside the left content; if only one fits, show the **time alone** (`HH:MM`). Below 30 columns it stays clock-free. Reserve the right columns so the clock never overlaps the left side, and redraw only when the minute changes (do not add a per-second clock tick).
 - Colors come from `src/theme.rs` palettes (Monokai, Nord, One Dark, Paper, Gruvbox Dark, Dracula, Tokyo Night, Catppuccin, Solarized Dark, Solarized Light). Rendering code must use `self.palette` roles rather than hardcoded colors. New color roles must be added to every theme. Theme tests require distinct surface colors and readable light/dark contrast; light themes are not limited to Paper.
 

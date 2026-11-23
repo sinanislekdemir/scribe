@@ -231,6 +231,54 @@ fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric()
 }
 
+/// Count words in a paragraph body, split between plain prose and dialogue.
+/// `“` opens a quote, `”` closes it, and an ASCII `"` toggles. The `open` flag
+/// is carried across paragraphs so dialogue that continues in the next
+/// paragraph stays quoted. A dangling opening quote counts to the end.
+fn count_dialogue_words(chars: &[StyledChar], open: &mut bool) -> (usize, usize) {
+    let mut plain = 0;
+    let mut dialogue = 0;
+    let mut in_word = false;
+    for c in chars {
+        match c.ch {
+            '“' | '”' | '"' => {
+                if in_word {
+                    if *open {
+                        dialogue += 1;
+                    } else {
+                        plain += 1;
+                    }
+                    in_word = false;
+                }
+                *open = match c.ch {
+                    '“' => true,
+                    '”' => false,
+                    _ => !*open,
+                };
+            }
+            ch if ch.is_whitespace() => {
+                if in_word {
+                    if *open {
+                        dialogue += 1;
+                    } else {
+                        plain += 1;
+                    }
+                    in_word = false;
+                }
+            }
+            _ => in_word = true,
+        }
+    }
+    if in_word {
+        if *open {
+            dialogue += 1;
+        } else {
+            plain += 1;
+        }
+    }
+    (plain, dialogue)
+}
+
 #[derive(Clone, Debug)]
 pub struct Chapter {
     pub number: u32,
@@ -262,6 +310,24 @@ impl Chapter {
                 .iter()
                 .map(|p| p.chars.iter().filter(|c| c.ch != '\n').count())
                 .sum::<usize>()
+    }
+
+    /// Body word counts as `(plain, dialogue)`, excluding the chapter title and
+    /// subheadings. The quote state carries across paragraphs so dialogue that
+    /// continues in the next paragraph stays quoted.
+    pub fn dialogue_word_counts(&self) -> (usize, usize) {
+        let mut open = false;
+        let mut plain = 0;
+        let mut dialogue = 0;
+        for para in &self.paragraphs {
+            if para.kind == ParaKind::Subheading {
+                continue;
+            }
+            let (p, d) = count_dialogue_words(&para.chars, &mut open);
+            plain += p;
+            dialogue += d;
+        }
+        (plain, dialogue)
     }
 
     pub fn ensure_paragraph(&mut self) {
@@ -315,6 +381,20 @@ impl Book {
 
     pub fn total_chars(&self) -> usize {
         self.char_count()
+    }
+
+    /// Body word counts as `(plain, dialogue)`. Titles are excluded. Dialogue
+    /// is the text inside `“…”` or an ASCII `"…"` pair; the quote state does
+    /// not carry across chapters.
+    pub fn dialogue_word_counts(&self) -> (usize, usize) {
+        let mut plain = 0;
+        let mut dialogue = 0;
+        for chapter in &self.chapters {
+            let (p, d) = chapter.dialogue_word_counts();
+            plain += p;
+            dialogue += d;
+        }
+        (plain, dialogue)
     }
 
     pub fn total_words(&self) -> usize {
@@ -390,6 +470,21 @@ mod tests {
         assert_eq!(p.word_range(8), Some((8, 13)));
         assert_eq!(p.word_range(13), Some((8, 13)));
         assert_eq!(Para::default().word_range(0), None);
+    }
+
+    #[test]
+    fn dialogue_word_counts_follow_quotes_across_paragraphs() {
+        let mut chapter = Chapter::new(1, "Başlık");
+        chapter.paragraphs = vec![
+            Para::from_text("“bir iki üç” dört beş"),
+            Para::from_text("“uzun"),
+            Para::from_text("konuşma” altı"),
+        ];
+        assert_eq!(chapter.dialogue_word_counts(), (3, 5));
+
+        let mut chapter = Chapter::new(1, "Başlık");
+        chapter.paragraphs = vec![Para::from_text("said \"stop.\" then")];
+        assert_eq!(chapter.dialogue_word_counts(), (2, 1));
     }
 
     #[test]
